@@ -1,0 +1,80 @@
+# SCRATCH / THROWAWAY — issue #893 stabilization experiment. NOT for merge.
+# Runs the ACTUAL segfaulting Java integration tests (the real workload, which my
+# isolated harness could not reproduce) in a time-boxed loop, comparing baseline Ollama
+# vs constrained (OLLAMA_NUM_PARALLEL=1 + OLLAMA_MAX_LOADED_MODELS=1). Goal: (1) reproduce
+# the crash under real conditions, (2) measure whether constraining Ollama lowers the rate.
+name: stabilize-v3-893
+
+on:
+  push:
+    branches: [ 893-ci-flaky-mitigation ]
+  workflow_dispatch:
+
+jobs:
+  loop:
+    name: ${{ matrix.mode }} #${{ matrix.rep }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [ baseline, constrained ]
+        rep: [ 1, 2, 3 ]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Build Java + install dist (flink-2.0)
+        env:
+          SKIP_SPOTLESS_CHECK: "true"
+        run: |
+          bash tools/build.sh -j
+          mvn --batch-mode --no-transfer-progress install -pl "dist/flink-2.0" -DskipTests -Dspotless.skip=true
+
+      - name: Install + start ollama (${{ matrix.mode }})
+        run: |
+          bash tools/start_ollama_server.sh
+          if [ "${{ matrix.mode }}" = "constrained" ]; then
+            sudo mkdir -p /etc/systemd/system/ollama.service.d
+            printf '[Service]\nEnvironment=OLLAMA_NUM_PARALLEL=1\nEnvironment=OLLAMA_MAX_LOADED_MODELS=1\n' \
+              | sudo tee /etc/systemd/system/ollama.service.d/override.conf
+            sudo systemctl daemon-reload
+          fi
+          sudo systemctl enable --now ollama || sudo systemctl start ollama || true
+          for i in $(seq 1 60); do curl -sf http://localhost:11434/api/version && break; sleep 2; done
+          echo; echo "effective ollama env:"; sudo systemctl show ollama -p Environment || true
+          ollama pull qwen3:1.7b
+          ollama pull qwen3:0.6b
+          free -h; nproc
+
+      - name: Loop the segfaulting IT tests and count crashes
+        run: |
+          set -uo pipefail
+          TESTS="YamlLoaderIntegrationTest,ChatModelIntegrationTest,ReActAgentTest"
+          budget_end=$(( $(date +%s) + 1980 ))   # ~33 min of looping
+          iters=0; crashes=0
+          while [ "$(date +%s)" -lt "$budget_end" ]; do
+            iters=$((iters+1))
+            out=$(mvn --batch-mode --no-transfer-progress test \
+                    -pl 'e2e-test/flink-agents-end-to-end-tests-integration' \
+                    -Pflink-2.0 -Dspotless.skip=true -Dtest="$TESTS" 2>&1 || true)
+            if echo "$out" | grep -qiE "process has terminated|segmentation fault"; then
+              crashes=$((crashes+1))
+              echo "iter $iters: SEGFAULT  (crashes=$crashes)"
+            elif echo "$out" | grep -qE "BUILD SUCCESS"; then
+              echo "iter $iters: pass"
+            else
+              echo "iter $iters: non-segfault failure (other) -> $(echo "$out" | grep -iE 'ERROR|FAIL' | head -1)"
+            fi
+          done
+          echo "=================================================================="
+          echo "RESULT mode=${{ matrix.mode }} rep=${{ matrix.rep }} iters=$iters segfaults=$crashes"
+          echo "=================================================================="
+
+      - name: Ollama journald (crash markers)
+        if: always()
+        run: sudo journalctl -u ollama --no-pager 2>/dev/null | grep -iE "signal|segv|terminat|panic|error" | tail -40 || true
