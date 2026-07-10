@@ -1,0 +1,145 @@
+# SCRATCH / THROWAWAY — issue #893 make-or-break verification. NOT for merge.
+# Answers: once llama-server segfaults, (i) does the ollama daemon self-heal on a plain
+# retry, and (ii) does `systemctl restart ollama` clear it so a retry succeeds?
+name: segfault-repro-893
+
+on:
+  push:
+    branches: [ 893-ci-flaky-mitigation ]
+  workflow_dispatch:
+
+jobs:
+  repro:
+    name: ollama segfault recovery probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ollama (same path as CI)
+        run: bash tools/start_ollama_server.sh
+
+      - name: Environment / version
+        run: |
+          set -x
+          uname -a; nproc; free -h
+          ollama --version || true
+          systemctl status ollama --no-pager || true
+          for i in $(seq 1 30); do curl -sf http://localhost:11434/api/version && break; sleep 2; done
+          echo
+
+      - name: Pull models used by the e2e suite
+        run: |
+          ollama pull qwen3:1.7b
+          ollama pull qwen3:0.6b
+
+      - name: Recovery probe
+        run: |
+          set -uo pipefail
+          API=http://localhost:11434
+
+          # One non-streaming generation. Prints raw JSON. Success -> has .response;
+          # a crashed runner -> {"error":"llama-server process has terminated: ... segmentation fault ..."}
+          infer() {
+            local model="$1"; local prompt="${2:-Respond with one short sentence.}"; local np="${3:-40}"
+            curl -s -m 180 "$API/api/generate" \
+              -d "{\"model\":\"$model\",\"prompt\":\"$prompt\",\"stream\":false,\"options\":{\"num_predict\":$np}}"
+          }
+          is_crash()   { echo "$1" | grep -qiE "process has terminated|segmentation fault"; }
+          is_success() { echo "$1" | grep -q '"response"'; }
+
+          wait_healthy() {
+            for i in $(seq 1 60); do curl -sf "$API/api/version" >/dev/null 2>&1 && return 0; sleep 2; done
+            return 1
+          }
+
+          # Kill the model runner subprocess with SIGSEGV to force the EXACT error state
+          # ("signal: segmentation fault") that CI hits. Runs as user ollama -> needs sudo.
+          force_segv() {
+            local main_pid runners
+            main_pid=$(systemctl show -p MainPID --value ollama 2>/dev/null || true)
+            runners=$(pgrep -f 'ollama runner' || true)
+            [ -z "$runners" ] && runners=$(pgrep -f 'llama[-_]?server' || true)
+            [ -z "$runners" ] && [ -n "$main_pid" ] && runners=$(pgrep -P "$main_pid" || true)
+            echo "  serve MainPID=$main_pid ; runner pids=[$runners]"
+            ps -o pid,ppid,rss,comm,args -C ollama 2>/dev/null | head -20 || true
+            if [ -z "$runners" ]; then echo "  !! no runner pid found"; return 1; fi
+            for p in $runners; do sudo kill -SEGV "$p" 2>/dev/null && echo "  sent SIGSEGV -> $p"; done
+            return 0
+          }
+
+          echo "=================================================================="
+          echo "BASELINE — healthy inference before any fault injection"
+          echo "=================================================================="
+          out=$(infer qwen3:1.7b); is_success "$out" && echo "baseline: OK" || { echo "baseline: UNEXPECTED FAIL"; echo "$out"; }
+
+          CYCLES=3
+          for c in $(seq 1 $CYCLES); do
+            echo
+            echo "=================================================================="
+            echo "CYCLE $c / $CYCLES"
+            echo "=================================================================="
+
+            echo "--- start a long generation in the background, then SIGSEGV its runner"
+            infer qwen3:1.7b "Write a long detailed essay about distributed stream processing." 1500 > /tmp/inflight_$c.json 2>&1 &
+            bg=$!
+            sleep 4
+            force_segv || true
+            wait $bg 2>/dev/null || true
+            echo "  in-flight request result:"; sed -e 's/^/    /' /tmp/inflight_$c.json | head -3
+
+            echo "--- (i) RETRY WITHOUT RESTART: does the daemon self-heal? (5 attempts, 5s apart)"
+            heal_no_restart=no
+            for i in 1 2 3 4 5; do
+              out=$(infer qwen3:1.7b)
+              if is_success "$out"; then echo "    attempt $i: OK (self-healed WITHOUT restart)"; heal_no_restart=yes; break
+              elif is_crash "$out"; then echo "    attempt $i: still crashed"
+              else echo "    attempt $i: other -> $(echo "$out" | head -c 200)"; fi
+              sleep 5
+            done
+            echo "  >> self-heal without restart: $heal_no_restart"
+
+            echo "--- (ii) RESTART then retry: sudo systemctl restart ollama"
+            sudo systemctl restart ollama
+            wait_healthy && echo "    daemon healthy after restart" || echo "    daemon did NOT come healthy"
+            heal_after_restart=no
+            for i in 1 2 3; do
+              out=$(infer qwen3:1.7b)
+              if is_success "$out"; then echo "    post-restart attempt $i: OK"; heal_after_restart=yes; break
+              elif is_crash "$out"; then echo "    post-restart attempt $i: still crashed"
+              else echo "    post-restart attempt $i: other -> $(echo "$out" | head -c 200)"; fi
+              sleep 3
+            done
+            echo "  >> RECOVERED AFTER RESTART: $heal_after_restart"
+          done
+
+          echo
+          echo "=================================================================="
+          echo "NATURAL REPRO — bounded stress loop (best-effort; may not fire)"
+          echo "=================================================================="
+          prompts=("Explain backpressure in stream processing." "List five uses of watermarks." \
+                   "Summarize the CAP theorem." "Describe exactly-once semantics." \
+                   "What is a keyed state backend?" "Compare batch vs streaming.")
+          natural_crashes=0; iters=0; deadline=$(( $(date +%s) + 720 ))
+          while [ "$(date +%s)" -lt "$deadline" ] && [ "$iters" -lt 120 ]; do
+            iters=$((iters+1))
+            model=qwen3:1.7b; [ $((iters % 3)) -eq 0 ] && model=qwen3:0.6b
+            out=$(infer "$model" "${prompts[$((iters % 6))]}" 200)
+            if is_crash "$out"; then
+              natural_crashes=$((natural_crashes+1))
+              echo "  iter $iters ($model): NATURAL SEGFAULT #$natural_crashes"
+              echo "    restarting ollama and retrying same prompt..."
+              sudo systemctl restart ollama; wait_healthy || true
+              out2=$(infer "$model" "${prompts[$((iters % 6))]}" 200)
+              is_success "$out2" && echo "    -> recovered after restart" || echo "    -> STILL failing after restart: $(echo "$out2" | head -c 200)"
+            fi
+          done
+          echo "  natural stress: $iters iterations, $natural_crashes natural segfault(s)"
+
+      - name: Ollama daemon logs (journald — the view CI step logs never capture)
+        if: always()
+        run: |
+          echo "=== journalctl -u ollama (tail 400) ==="
+          sudo journalctl -u ollama --no-pager | tail -400 || true
+          echo "=== dmesg segfault/oom markers ==="
+          sudo dmesg 2>/dev/null | grep -iE "segfault|oom|killed process|general protection" | tail -40 || true
