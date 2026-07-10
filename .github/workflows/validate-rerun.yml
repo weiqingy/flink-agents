@@ -19,12 +19,25 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
+          set -uo pipefail
           echo "triggering run_attempt=${{ github.event.workflow_run.run_attempt }}"
-          mapfile -t ids < <(gh run view "$RUN_ID" --json jobs \
-            --jq '.jobs[]
-                  | select(.conclusion == "failure")
-                  | select(.name | test("^(it-python|it-java|cross-language)"))
-                  | .databaseId')
+          # The jobs sub-resource can lag the workflow_run:completed event, so poll until
+          # every job has a final conclusion before filtering.
+          ids=()
+          for i in $(seq 1 15); do
+            jobs_json=$(gh run view "$RUN_ID" --json jobs 2>/dev/null || echo '{"jobs":[]}')
+            total=$(echo "$jobs_json" | jq '.jobs | length')
+            pending=$(echo "$jobs_json" | jq '[.jobs[] | select(.conclusion == null)] | length')
+            if [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; then
+              mapfile -t ids < <(echo "$jobs_json" | jq -r '.jobs[]
+                    | select(.conclusion == "failure")
+                    | select(.name | test("^(it-python|it-java|cross-language)"))
+                    | .databaseId')
+              break
+            fi
+            echo "jobs not finalized yet (total=$total pending=$pending), waiting..."
+            sleep 4
+          done
           echo "failed IT job ids: ${ids[*]:-<none>}"
           if [ "${#ids[@]}" -eq 0 ]; then echo "nothing to re-run"; exit 0; fi
           for id in "${ids[@]}"; do
