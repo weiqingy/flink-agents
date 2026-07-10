@@ -17,22 +17,23 @@ jobs:
       - name: Re-run failed IT jobs on a fresh runner
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           set -uo pipefail
           echo "triggering run_attempt=${{ github.event.workflow_run.run_attempt }}"
-          # The jobs sub-resource can lag the workflow_run:completed event, so poll until
-          # every job has a final conclusion before filtering.
+          # Query the jobs REST endpoint with the repo pinned (this companion has no checkout,
+          # so `gh run view` cannot infer the repo). Poll until all jobs report a conclusion.
           ids=()
           for i in $(seq 1 15); do
-            jobs_json=$(gh run view "$RUN_ID" --json jobs 2>/dev/null || echo '{"jobs":[]}')
+            jobs_json=$(gh api "repos/${GH_REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" 2>/dev/null || echo '{"jobs":[]}')
             total=$(echo "$jobs_json" | jq '.jobs | length')
             pending=$(echo "$jobs_json" | jq '[.jobs[] | select(.conclusion == null)] | length')
             if [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; then
               mapfile -t ids < <(echo "$jobs_json" | jq -r '.jobs[]
                     | select(.conclusion == "failure")
                     | select(.name | test("^(it-python|it-java|cross-language)"))
-                    | .databaseId')
+                    | .id')
               break
             fi
             echo "jobs not finalized yet (total=$total pending=$pending), waiting..."
@@ -42,5 +43,5 @@ jobs:
           if [ "${#ids[@]}" -eq 0 ]; then echo "nothing to re-run"; exit 0; fi
           for id in "${ids[@]}"; do
             echo "re-running job $id on a fresh runner..."
-            gh run rerun "$RUN_ID" --job "$id"
+            gh run rerun --job "$id"
           done
