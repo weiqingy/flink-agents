@@ -1,0 +1,33 @@
+name: Validate rerun companion
+on:
+  workflow_run:
+    workflows: ["Validate CI"]
+    types: [completed]
+permissions:
+  actions: write
+  contents: read
+jobs:
+  rerun:
+    if: >
+      github.repository == 'weiqingy/flink-agents' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-run failed IT jobs on a fresh runner
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          echo "triggering run_attempt=${{ github.event.workflow_run.run_attempt }}"
+          mapfile -t ids < <(gh run view "$RUN_ID" --json jobs \
+            --jq '.jobs[]
+                  | select(.conclusion == "failure")
+                  | select(.name | test("^(it-python|it-java|cross-language)"))
+                  | .databaseId')
+          echo "failed IT job ids: ${ids[*]:-<none>}"
+          if [ "${#ids[@]}" -eq 0 ]; then echo "nothing to re-run"; exit 0; fi
+          for id in "${ids[@]}"; do
+            echo "re-running job $id on a fresh runner..."
+            gh run rerun "$RUN_ID" --job "$id"
+          done
