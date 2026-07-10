@@ -22,11 +22,19 @@ jobs:
       - name: Environment / version
         run: |
           set -x
-          uname -a; nproc; free -h
+          uname -a; nproc; free -h; ps -p 1 -o comm=
           ollama --version || true
           systemctl status ollama --no-pager || true
-          for i in $(seq 1 30); do curl -sf http://localhost:11434/api/version && break; sleep 2; done
-          echo
+
+      - name: Ensure ollama systemd service is running (as CI does)
+        run: |
+          # In CI, install.sh prints ">>> Enabling and starting ollama service..."
+          # and ollama runs as the systemd unit ollama.service. Early in a job the
+          # installer can transiently see "systemd is not running" and skip the start,
+          # so start the same unit explicitly, then wait for the API.
+          sudo systemctl enable --now ollama || sudo systemctl start ollama || true
+          for i in $(seq 1 60); do curl -sf http://localhost:11434/api/version && break; sleep 2; done
+          echo; systemctl status ollama --no-pager || true
 
       - name: Pull models used by the e2e suite
         run: |
