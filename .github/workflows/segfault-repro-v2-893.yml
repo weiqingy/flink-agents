@@ -1,0 +1,133 @@
+# SCRATCH / THROWAWAY — issue #893 faithful reproduction of the llama-server segfault.
+# v1 (sequential inference) got 0 crashes; v2 exercises the real triggers: concurrency,
+# model-load churn, and grammar-constrained (format=json) decoding. On the FIRST natural
+# crash in a job it resolves the make-or-break: does the daemon self-heal on a plain retry,
+# and does `systemctl restart ollama` recover it? Runs a small matrix to accumulate crashes.
+name: segfault-repro-v2-893
+
+on:
+  push:
+    branches: [ 893-ci-flaky-mitigation ]
+  workflow_dispatch:
+
+jobs:
+  repro:
+    name: repro ${{ matrix.idx }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install + start ollama (as CI)
+        run: |
+          bash tools/start_ollama_server.sh
+          sudo systemctl enable --now ollama || sudo systemctl start ollama || true
+          for i in $(seq 1 60); do curl -sf http://localhost:11434/api/version && break; sleep 2; done
+          ollama pull qwen3:1.7b
+          ollama pull qwen3:0.6b
+          nproc; free -h; ollama --version || true
+
+      - name: Faithful stress (concurrency + churn + grammar) with make-or-break on first crash
+        run: |
+          set -uo pipefail
+          API=http://localhost:11434
+          SCHEMA='{"type":"object","properties":{"answer":{"type":"string"},"score":{"type":"integer"},"reasons":{"type":"array","items":{"type":"string"}}},"required":["answer","score","reasons"]}'
+          PROMPTS=("Rate distributed stream processing 1-10 and justify in detail."
+                   "Evaluate exactly-once semantics and explain the tradeoffs."
+                   "Score watermark strategies and give reasons."
+                   "Assess backpressure handling with a thorough explanation.")
+
+          is_crash()   { echo "$1" | grep -qiE "process has terminated|segmentation fault"; }
+          is_success() { echo "$1" | grep -q '"message"\|"response"'; }
+
+          # One grammar-constrained chat (structured output path, like the e2e suite).
+          chat() {
+            local m="$1"; local p="$2"
+            curl -s -m 120 "$API/api/chat" -d "{
+              \"model\":\"$m\",
+              \"messages\":[{\"role\":\"user\",\"content\":\"$p\"}],
+              \"stream\":false,
+              \"format\":$SCHEMA,
+              \"options\":{\"num_predict\":400,\"temperature\":0.8}
+            }"
+          }
+          wait_healthy() { for i in $(seq 1 60); do curl -sf "$API/api/version" >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
+
+          CRASHES=/tmp/crashes; : > $CRASHES
+          MOB_DONE=/tmp/mob_done         # make-or-break resolved marker
+          DEADLINE=$(( $(date +%s) + 1080 ))   # ~18 min of stress
+
+          # Resolve the make-or-break the first time ANY worker sees a real crash.
+          resolve_make_or_break() {
+            [ -f "$MOB_DONE" ] && return 0
+            echo "MOB" > "$MOB_DONE"
+            {
+              echo "=================================================================="
+              echo "FIRST NATURAL CRASH — resolving make-or-break"
+              echo "=================================================================="
+              echo "--- (i) retry WITHOUT restart, 6 attempts 5s apart (does it self-heal / wedge?)"
+              healed=no
+              for i in $(seq 1 6); do
+                o=$(chat qwen3:1.7b "Short healthcheck sentence.")
+                if is_success "$o"; then echo "    attempt $i: OK (self-healed, no restart)"; healed=yes; break
+                elif is_crash "$o"; then echo "    attempt $i: still crashed (wedged)"
+                else echo "    attempt $i: other -> $(echo "$o" | head -c 160)"; fi
+                sleep 5
+              done
+              echo "  >> self-heal WITHOUT restart: $healed"
+              echo "--- (ii) systemctl restart ollama, then retry"
+              sudo systemctl restart ollama; wait_healthy && echo "    healthy after restart" || echo "    NOT healthy after restart"
+              rok=no
+              for i in $(seq 1 4); do
+                o=$(chat qwen3:1.7b "Short healthcheck sentence.")
+                if is_success "$o"; then echo "    post-restart attempt $i: OK"; rok=yes; break
+                elif is_crash "$o"; then echo "    post-restart attempt $i: still crashed"
+                else echo "    post-restart attempt $i: other -> $(echo "$o" | head -c 160)"; fi
+                sleep 3
+              done
+              echo "  >> RECOVERED AFTER RESTART: $rok"
+              echo "=================================================================="
+            } >> /tmp/mob.log 2>&1
+          }
+
+          worker() {
+            local id="$1"
+            while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+              local m="qwen3:1.7b"; [ $((RANDOM % 3)) -eq 0 ] && m="qwen3:0.6b"
+              local p="${PROMPTS[$((RANDOM % 4))]}"
+              local o; o=$(chat "$m" "$p")
+              if is_crash "$o"; then echo "$id" >> "$CRASHES"; resolve_make_or_break; fi
+            done
+          }
+
+          # churn worker: periodically unload models to force runner reload (a crash trigger)
+          churn() {
+            while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+              curl -s -m 30 "$API/api/generate" -d '{"model":"qwen3:1.7b","keep_alive":0,"prompt":""}' >/dev/null 2>&1 || true
+              curl -s -m 30 "$API/api/generate" -d '{"model":"qwen3:0.6b","keep_alive":0,"prompt":""}' >/dev/null 2>&1 || true
+              sleep 20
+            done
+          }
+
+          echo "Starting 6 concurrent workers + churn until deadline (~18 min)..."
+          for k in $(seq 1 6); do worker "$k" & done
+          churn &
+          wait
+
+          n=$(wc -l < "$CRASHES" 2>/dev/null || echo 0)
+          echo "=================================================================="
+          echo "JOB ${{ matrix.idx }} RESULT: natural segfaults = $n"
+          echo "=================================================================="
+          if [ -f /tmp/mob.log ]; then echo "--- make-or-break log ---"; cat /tmp/mob.log; fi
+
+      - name: Ollama journald + dmesg
+        if: always()
+        run: |
+          echo "=== journalctl -u ollama | crash/signal lines ==="
+          sudo journalctl -u ollama --no-pager 2>/dev/null | grep -iE "signal|segv|terminat|panic|core dump|error|failed|SIGILL|illegal" | tail -80 || true
+          echo "=== dmesg ==="
+          sudo dmesg 2>/dev/null | grep -iE "segfault|oom|killed process|general protection|trap|illegal" | tail -40 || true

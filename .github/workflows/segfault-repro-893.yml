@@ -4,8 +4,6 @@
 name: segfault-repro-893
 
 on:
-  push:
-    branches: [ 893-ci-flaky-mitigation ]
   workflow_dispatch:
 
 jobs:
