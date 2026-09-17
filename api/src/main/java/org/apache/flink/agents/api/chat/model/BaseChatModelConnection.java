@@ -54,10 +54,14 @@ public abstract class BaseChatModelConnection extends Resource {
      * <p>Capability is <b>model-dependent</b>, not connection-wide: a single provider connection
      * commonly serves both models that accept a native schema parameter and models that do not. The
      * model to ask about is whatever {@link #effectiveModelFor(Map)} returns for the parameters a
-     * request would be built from, and a caller outside the connection asks that hook and nothing
-     * else. Such a caller must not substitute the identifier the request is issued against: on a
-     * deployment-based provider the request targets a deployment name the user chose while
-     * capability belongs to the model backing it, so the two disagree in both directions.
+     * request would be built from, and a caller outside this class asks that hook and nothing else.
+     * Outside this class rather than outside this package: both members are {@code protected}, so a
+     * caller further out reaches the question through {@link
+     * BaseChatModelSetup#willApplyNativeStructuredOutput(Object)}, which holds a connection and
+     * composes the answer on its behalf. Such a caller must not substitute the identifier the
+     * request is issued against: on a deployment-based provider the request targets a deployment
+     * name the user chose while capability belongs to the model backing it, so the two disagree in
+     * both directions.
      *
      * <p>The default {@code false} keeps a connection on the prompt-engineering fallback. A
      * connection that classifies by model name must report {@code false} for a name it does not
@@ -111,12 +115,13 @@ public abstract class BaseChatModelConnection extends Resource {
      * these tools and parameters, leaving the effective model's capability out of the answer.
      *
      * <p>Feasibility, not capability: the answer covers everything this connection's native branch
-     * requires of a request apart from the effective model, and says nothing about whether the
-     * model the request names would honor a native schema, which is the separate question {@link
-     * #supportsNativeStructuredOutput(String)} answers. Neither answer bounds the other, in either
-     * direction. A POJO on a model the connection does not classify as capable is feasible here and
-     * not capable there; a {@code RowTypeInfo} on a connection whose capability predicate is
-     * unconditionally true is capable there and not feasible here.
+     * requires apart from the effective model, including conditions fixed by the connection's own
+     * configuration rather than carried by the request, and says nothing about whether the model
+     * {@link #effectiveModelFor(Map)} names would honor a native schema, which is the separate
+     * question {@link #supportsNativeStructuredOutput(String)} answers. Neither answer bounds the
+     * other, in either direction. A POJO on a model the connection does not classify as capable is
+     * feasible here and not capable there; a {@code RowTypeInfo} on a connection whose capability
+     * predicate is unconditionally true is capable there and not feasible here.
      *
      * <p>This answer is binding rather than advisory, which is the asymmetry that keeps it separate
      * from capability. A request whose schema this connection cannot encode has no native form to
@@ -127,7 +132,10 @@ public abstract class BaseChatModelConnection extends Resource {
      * native branch, so that the answer cannot drift from what the request ends up carrying.
      *
      * <p>A {@code false} answer is not an error: it reports that the request would carry no native
-     * schema, so the caller keeps the prompt-engineering fallback rather than losing the schema.
+     * schema, so the caller keeps the prompt-engineering fallback rather than losing the schema. A
+     * {@code true} is not a promise that the call succeeds either: a connection may still raise
+     * once its native branch has decided to apply the schema, as happens where the caller supplied
+     * a response format of its own that conflicts with it.
      *
      * <p>The default {@code false} is safe only for a connection that translates no schema at all.
      * A connection whose request builder has a native branch but which leaves this unoverridden
@@ -143,8 +151,8 @@ public abstract class BaseChatModelConnection extends Resource {
      * @param outputSchema the schema the request would carry, or null for an unconstrained request
      * @param tools the tools the request would bind, may be null or empty for none
      * @param modelParams the parameters the request would be built from, may be null
-     * @return true if these inputs satisfy every condition the native branch imposes apart from the
-     *     effective model's capability
+     * @return true if every condition the native branch imposes is met apart from the effective
+     *     model's capability
      */
     protected boolean canApplyNativeStructuredOutput(
             @Nullable Object outputSchema,

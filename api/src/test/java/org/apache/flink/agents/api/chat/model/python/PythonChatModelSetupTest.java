@@ -153,6 +153,33 @@ public class PythonChatModelSetupTest {
     }
 
     @Test
+    void testChatStructuredIsRefused() {
+        assertThatThrownBy(
+                        () ->
+                                pythonChatModelSetup.chatStructured(
+                                        Collections.singletonList(mock(ChatMessage.class)),
+                                        new HashMap<>(),
+                                        String.class))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("output schema");
+    }
+
+    @Test
+    void testWillApplyNativeStructuredOutputIsFalse() {
+        assertThat(pythonChatModelSetup.willApplyNativeStructuredOutput(String.class)).isFalse();
+
+        // Also false where the descriptor asks for native explicitly: this setup binds no
+        // connection to ask and carries no schema across, so there is nothing a different
+        // answer could act on.
+        when(mockDescriptor.getArgument("structured_output_strategy")).thenReturn("NATIVE");
+        PythonChatModelSetup forcedNative =
+                new PythonChatModelSetup(
+                        mockAdapter, mockChatModelSetup, mockDescriptor, mockGetResource);
+
+        assertThat(forcedNative.willApplyNativeStructuredOutput(String.class)).isFalse();
+    }
+
+    @Test
     void testInheritanceFromBaseChatModelSetup() {
         assertThat(pythonChatModelSetup)
                 .isInstanceOf(org.apache.flink.agents.api.chat.model.BaseChatModelSetup.class);
