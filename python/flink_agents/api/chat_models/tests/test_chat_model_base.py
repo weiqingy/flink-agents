@@ -15,7 +15,7 @@
 #  See the License for the specific language governing permissions and
 # limitations under the License.
 #################################################################################
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 
 import pytest
 from pydantic import BaseModel, Field, ValidationError
@@ -418,3 +418,320 @@ def test_feasibility_predicate_does_not_consume_the_tools() -> None:
     )
 
     assert tools == [tool]
+
+
+class _GateConnection(_RecordingConnection):
+    """Connection whose feasibility and capability answers are scripted.
+
+    Records what it was asked and what a schema-carrying call carried. It extends
+    ``_RecordingConnection`` rather than editing it, so the tests above keep
+    asserting the inherited base answers.
+    """
+
+    feasible: bool = False
+    capable: bool = False
+    feasibility_asked: bool = False
+    capability_asked: bool = False
+    asked_schema: OutputSchema | None = None
+    asked_tools: List[Tool] | None = None
+    asked_model_kwargs: Dict[str, Any] | None = None
+    asked_model: str | None = None
+    captured_tools: List[Tool] | None = None
+
+    def can_apply_native_structured_output(
+        self,
+        output_schema: OutputSchema | None,
+        tools: List[Tool] | None,
+        model_kwargs: Mapping[str, Any] | None,
+    ) -> bool:
+        """Answer the scripted feasibility, recording what it was asked about."""
+        self.feasibility_asked = True
+        self.asked_schema = output_schema
+        self.asked_tools = None if tools is None else list(tools)
+        self.asked_model_kwargs = None if model_kwargs is None else dict(model_kwargs)
+        return self.feasible
+
+    def effective_model_for(self, model_kwargs: Mapping[str, Any] | None) -> str | None:
+        """Answer with a sentinel no parameter value can supply.
+
+        Deliberately not the ``model`` parameter: a gate that read the mapping itself
+        instead of asking this hook would still look correct against a connection
+        inheriting the base body, which is exactly ``model_kwargs.get("model")``.
+        """
+        return "backing-model"
+
+    def supports_native_structured_output(self, effective_model: str | None) -> bool:
+        """Answer the scripted capability, recording the model it was asked about."""
+        self.capability_asked = True
+        self.asked_model = effective_model
+        return self.capable
+
+    def chat(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: List[Tool] | None = None,
+        output_schema: OutputSchema | None = None,
+        **kwargs: Any,
+    ) -> ChatMessage:
+        """Capture the tools alongside everything the base connection captures."""
+        self.captured_tools = None if tools is None else list(tools)
+        super().chat(messages, tools=tools, output_schema=output_schema, **kwargs)
+        return ChatMessage(role=MessageRole.ASSISTANT, content="structured")
+
+
+class _GateChatModelSetup(_RecordingChatModelSetup):
+    """Setup whose ``model_kwargs`` a test can populate.
+
+    ``_RecordingChatModelSetup`` returns an empty mapping from a property body, which
+    cannot express the parameters a gate builds a call from. Subclassing leaves that
+    fixture and its existing uses untouched.
+    """
+
+    parameters: Dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def model_kwargs(self) -> Dict[str, Any]:
+        """Return a fresh copy, since callers merge per-call parameters into it."""
+        return dict(self.parameters)
+
+
+def _build_gate(
+    *,
+    feasible: bool = True,
+    capable: bool = True,
+    strategy: StructuredOutputStrategy = StructuredOutputStrategy.AUTO,
+    prompt: Prompt | None = None,
+) -> tuple[_GateChatModelSetup, _GateConnection]:
+    setup = _GateChatModelSetup(
+        connection="c",
+        model="m",
+        prompt=prompt,
+        structured_output_strategy=strategy,
+    )
+    connection = _GateConnection(feasible=feasible, capable=capable)
+    setup._resolved_connection = connection
+    return setup, connection
+
+
+def _pojo_schema() -> OutputSchema:
+    """A schema form a connection with a native branch can translate."""
+    return OutputSchema(output_schema=_Answer)
+
+
+def _row_schema() -> OutputSchema:
+    """A schema form no connection translates natively."""
+    return OutputSchema(
+        output_schema=RowTypeInfo(
+            field_types=[BasicTypeInfo.STRING_TYPE_INFO()], field_names=["name"]
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("row", "strategy", "schema_factory", "feasible", "capable", "expected"),
+    [
+        (1, StructuredOutputStrategy.AUTO, _pojo_schema, True, True, True),
+        (2, StructuredOutputStrategy.AUTO, _pojo_schema, True, False, False),
+        (3, StructuredOutputStrategy.AUTO, _pojo_schema, False, True, False),
+        (4, StructuredOutputStrategy.AUTO, _row_schema, False, True, False),
+        (5, StructuredOutputStrategy.AUTO, _row_schema, False, False, False),
+        (6, StructuredOutputStrategy.PROMPT, _pojo_schema, True, True, False),
+        (7, StructuredOutputStrategy.NATIVE, _pojo_schema, True, True, True),
+        (8, StructuredOutputStrategy.NATIVE, _pojo_schema, True, False, True),
+    ],
+)
+def test_will_apply_native_combines_policy_capability_and_feasibility(
+    row: int,
+    strategy: StructuredOutputStrategy,
+    schema_factory: Any,
+    feasible: bool,
+    capable: bool,
+    expected: bool,
+) -> None:
+    """Policy, capability and feasibility compose, one case per behavior-table row.
+
+    A ``BaseModel`` subclass stands for a form a connection can translate and the
+    ``RowTypeInfo`` wrapper for one none of them can.
+    """
+    setup, connection = _build_gate(
+        feasible=feasible, capable=capable, strategy=strategy
+    )
+    setup.parameters["model"] = "gpt-4o"
+    # Bound so the empty-tools assertion below compares against something. A ReAct
+    # agent always binds tools, so a gate that asked feasibility with them would make
+    # a connection that skips a native schema on a tool-carrying request report every
+    # such request infeasible, and native structured output would never fire there.
+    setup.tools.append(_StubTool())
+    schema = schema_factory()
+
+    assert setup.will_apply_native_structured_output(schema) is expected, (
+        f"behavior table row {row}"
+    )
+
+    # Asked about the schema as handed over, and about a call binding no tools with
+    # the parameters the setup would build the call from: the shape chat_structured
+    # sends.
+    assert connection.asked_schema is schema
+    assert connection.asked_tools == []
+    assert connection.asked_model_kwargs == {"model": "gpt-4o"}
+
+
+def test_will_apply_native_asks_capability_about_the_effective_model() -> None:
+    """Capability is asked about the model the connection's own hook names."""
+    setup, connection = _build_gate()
+    setup.parameters["model"] = "gpt-4o"
+    setup.model = "a-deployment-name"
+
+    assert setup.will_apply_native_structured_output(_pojo_schema()) is True
+
+    # Three identities are kept distinct on purpose: the configured
+    # "a-deployment-name", the "gpt-4o" in the parameters, and what the connection's
+    # own hook returns. On a deployment-based provider capability belongs to the model
+    # behind the deployment, so a gate reading either of the first two misclassifies
+    # it in both directions.
+    assert connection.asked_model == "backing-model"
+
+
+def test_will_apply_native_does_not_consult_capability_for_an_infeasible_schema() -> (
+    None
+):
+    """A schema no request can express is never put to the capability predicate.
+
+    Feasibility is asked first, so a predicate answering without consulting the
+    schema is never asked about a form its own connection has no translation for.
+    """
+    setup, connection = _build_gate(feasible=False, capable=True)
+
+    assert setup.will_apply_native_structured_output(_row_schema()) is False
+
+    assert connection.feasibility_asked is True
+    assert connection.capability_asked is False
+
+
+def test_will_apply_native_is_false_for_a_missing_schema() -> None:
+    """A call carrying no schema is never a native one, whatever the policy.
+
+    There is nothing to apply, so neither question arises and a forced NATIVE has
+    nothing to fail fast about.
+    """
+    setup, connection = _build_gate(strategy=StructuredOutputStrategy.NATIVE)
+
+    assert setup.will_apply_native_structured_output(None) is False
+
+    assert connection.feasibility_asked is False
+    assert connection.capability_asked is False
+
+
+def test_will_apply_native_raises_for_native_policy_on_an_infeasible_schema() -> None:
+    """A forced NATIVE fails fast on a schema the connection cannot apply at all.
+
+    No provider error could report it, because no request expresses the schema in the
+    first place, so the message carries both sides of the mismatch itself.
+    """
+    setup, _ = _build_gate(
+        feasible=False, capable=True, strategy=StructuredOutputStrategy.NATIVE
+    )
+    wrapped = _row_schema()
+
+    with pytest.raises(ValueError) as wrapped_error:
+        setup.will_apply_native_structured_output(wrapped)
+    with pytest.raises(ValueError) as pojo_error:
+        setup.will_apply_native_structured_output(_pojo_schema())
+
+    message = str(wrapped_error.value)
+    assert "_GateConnection" in message
+    # The wrapped shape rather than the wrapper: a user who configured a Row schema
+    # learns nothing from a message that renders the same wrapper for every one.
+    assert str(wrapped.output_schema) in message
+    assert "OutputSchema" not in message
+    assert f"{_Answer.__module__}.{_Answer.__qualname__}" in str(pojo_error.value)
+
+
+def test_native_policy_on_an_incapable_model_sends_the_schema() -> None:
+    """A forced NATIVE on an incapable model sends the schema rather than withholding.
+
+    The schema travels with no second capability test at this level, so an explicit
+    intent reaches the provider and a provider error is what answers it.
+    """
+    setup, connection = _build_gate(
+        feasible=True, capable=False, strategy=StructuredOutputStrategy.NATIVE
+    )
+    schema = _pojo_schema()
+
+    assert setup.will_apply_native_structured_output(schema) is True
+
+    setup.chat_structured([ChatMessage(role=MessageRole.USER, content="hi")], schema)
+
+    assert connection.captured_output_schema is schema
+
+
+def test_chat_structured_sends_no_tools_and_does_not_prepend_the_bound_prompt() -> None:
+    """The schema is the request's only description of the shape of the answer.
+
+    Bound tools make some providers drop a native schema outright, and ``chat``
+    prepends the bound prompt on the prompt alone, so a second pass over messages
+    that already came through it would repeat that prompt.
+    """
+    setup, connection = _build_gate(prompt=Prompt.from_text(text="Task: {key}"))
+    setup.tools.append(_StubTool())
+    schema = _pojo_schema()
+
+    response = setup.chat_structured(
+        [ChatMessage(role=MessageRole.USER, content="hi")], schema
+    )
+
+    assert response.content == "structured"
+    assert connection.captured_tools == []
+    assert len(connection.captured_messages) == 1
+    assert connection.captured_messages[0].content == "hi"
+    assert connection.captured_output_schema is schema
+
+
+def test_chat_structured_merges_per_call_parameters_over_the_setup_parameters() -> None:
+    """Per-call parameters merge over the setup's own, exactly as ``chat`` merges."""
+    setup, connection = _build_gate()
+    setup.parameters["model"] = "gpt-4o"
+    setup.parameters["temperature"] = 0.1
+    messages = [ChatMessage(role=MessageRole.USER, content="hi")]
+    schema = _pojo_schema()
+
+    setup.chat_structured(messages, schema, temperature=0.9)
+    assert connection.captured_kwargs == {"model": "gpt-4o", "temperature": 0.9}
+
+    # A caller with nothing to override passes no per-call parameters at all.
+    setup.chat_structured(messages, schema)
+    assert connection.captured_kwargs == {"model": "gpt-4o", "temperature": 0.1}
+
+
+def test_chat_structured_refuses_a_missing_schema() -> None:
+    """Refuses rather than issuing an ordinary call.
+
+    A connection reads a missing schema as an unconstrained request, so without the
+    check the caller would receive an ordinary response from the one method whose
+    purpose is to carry a schema.
+    """
+    setup, connection = _build_gate()
+
+    with pytest.raises(TypeError, match="chat_structured"):
+        setup.chat_structured([ChatMessage(role=MessageRole.USER, content="hi")], None)
+
+    assert connection.captured_output_schema is None
+    assert connection.captured_messages == []
+
+
+def test_will_apply_native_requires_a_resolved_connection() -> None:
+    """The gate has nothing to ask until open() has resolved the connection."""
+    setup = _GateChatModelSetup(connection="c", model="m")
+
+    with pytest.raises(TypeError, match="has not been resolved"):
+        setup.will_apply_native_structured_output(_pojo_schema())
+
+
+def test_chat_structured_requires_a_resolved_connection() -> None:
+    """The same precondition as every other call this setup issues."""
+    setup = _GateChatModelSetup(connection="c", model="m")
+
+    with pytest.raises(TypeError, match="has not been resolved"):
+        setup.chat_structured(
+            [ChatMessage(role=MessageRole.USER, content="hi")], _pojo_schema()
+        )

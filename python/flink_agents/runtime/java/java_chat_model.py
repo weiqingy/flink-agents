@@ -198,3 +198,73 @@ class JavaChatModelSetupImpl(JavaChatModelSetup):
         )
 
         return from_java_chat_message(j_response_message)
+
+    @override
+    def will_apply_native_structured_output(
+        self, output_schema: OutputSchema | None
+    ) -> bool:
+        """Always false: no call this class issues can carry an output schema, so for
+        none of them should one travel natively.
+
+        Two things put that out of reach rather than one. ``open`` here opens the Java
+        resource and resolves no connection, so the inherited body would have nothing
+        to ask; and ``chat`` above carries only messages and prompt arguments across
+        the bridge, so a schema has no way to travel with the call it would constrain.
+
+        False rather than a refusal, because the answer decides whether a caller keeps
+        describing the schema in the prompt, and keeping it is the outcome that works
+        here. The configured strategy is not consulted for the same reason: a request
+        for native structured output recorded on this side names nothing this class
+        could apply it to.
+
+        Parameters
+        ----------
+        output_schema : OutputSchema | None
+            The schema the call would carry, which this setup cannot carry.
+
+        Returns:
+        -------
+        bool
+            ``False``.
+        """
+        return False
+
+    @override
+    def chat_structured(
+        self,
+        messages: Sequence[ChatMessage],
+        output_schema: OutputSchema,
+        **kwargs: Any,
+    ) -> ChatMessage:
+        """Always refuses, because the bridge has no way to carry ``output_schema`` to
+        the Java setup: ``chat`` above puts messages and prompt arguments into the
+        call and nothing else.
+
+        Refusing rather than dropping the schema and calling anyway, so that an
+        unconstrained response can never be mistaken for a schema-conforming one.
+
+        Parameters
+        ----------
+        messages : Sequence[ChatMessage]
+            Unused; the call is refused before anything is sent.
+        output_schema : OutputSchema
+            The schema the bridge cannot carry.
+        **kwargs : Any
+            Unused.
+
+        Returns:
+        -------
+        ChatMessage
+            Never returns.
+
+        Raises:
+        ------
+        NotImplementedError
+            Always.
+        """
+        err_msg = (
+            "A Java chat model setup cannot be given an output schema from Python:"
+            " the bridge carries only messages and prompt arguments to the Java"
+            " setup's chat. Apply the schema on the Java side instead."
+        )
+        raise NotImplementedError(err_msg)

@@ -214,13 +214,14 @@ class BaseChatModelConnection(Resource, ABC):
         Feasibility, not capability: the answer covers everything this connection's
         native branch requires apart from the effective model, including conditions
         fixed by the connection's own configuration rather than carried by the request,
-        and says nothing about whether the model the request names would honor a native
-        schema, which is the separate question ``supports_native_structured_output``
-        answers. Neither answer bounds the other, in either direction. A ``BaseModel``
-        subclass on a model the connection does not classify as capable is feasible
-        here and not capable there; a ``RowTypeInfo``, which no connection translates
-        natively, on a connection whose capability predicate is unconditionally true is
-        capable there and not feasible here.
+        and says nothing about whether the model ``effective_model_for`` names would
+        honor a native schema, which is the separate question
+        ``supports_native_structured_output`` answers. Neither answer bounds the other,
+        in either direction. A ``BaseModel`` subclass on a model the connection does
+        not classify as capable is feasible here and not capable there; a
+        ``RowTypeInfo``, which no connection translates natively, on a connection whose
+        capability predicate is unconditionally true is capable there and not feasible
+        here.
 
         This answer is binding rather than advisory, which is the asymmetry that keeps
         it separate from capability. A request whose schema this connection cannot
@@ -511,6 +512,7 @@ class BaseChatModelSetup(Resource):
         self,
         messages: Sequence[ChatMessage],
         prompt_args: Mapping[str, Any] | None = None,
+        output_schema: OutputSchema | None = None,
         **kwargs: Any,
     ) -> ChatMessage:
         """Execute chat conversation.
@@ -528,6 +530,11 @@ class BaseChatModelSetup(Resource):
             Variables used to fill the prompt template, if a prompt resource is
             configured. Values are stringified via ``str()`` to match the
             ``Prompt.format_messages`` contract.
+        output_schema : OutputSchema | None
+            The schema the response should conform to, or ``None`` for an
+            unconstrained response. Declared rather than left to ``**kwargs``, which
+            is forwarded on to the provider SDK, so a schema landing there would
+            reach the request body.
         **kwargs : Any
             Additional parameters passed to the model service
 
@@ -567,7 +574,172 @@ class BaseChatModelSetup(Resource):
         merged_kwargs = self.model_kwargs.copy()
         merged_kwargs.update(kwargs)
         connection = self._get_connection()
-        return connection.chat(messages, tools=self._get_tools(), **merged_kwargs)
+        return connection.chat(
+            messages,
+            tools=self._get_tools(),
+            output_schema=output_schema,
+            **merged_kwargs,
+        )
+
+    def will_apply_native_structured_output(
+        self, output_schema: OutputSchema | None
+    ) -> bool:
+        """Whether ``output_schema`` should travel through the provider's native
+        structured output on a call issued through ``chat_structured``, rather than be
+        described to the model in the prompt.
+
+        Framework-facing rather than a user entry point: a user configures the outcome
+        through the structured-output strategy the descriptor carries instead of
+        calling this.
+
+        The answer composes what the connection reports about a request of that shape,
+        what it reports about the model its own ``effective_model_for`` names for such
+        a call, and what the configured strategy makes of the two. Feasibility is asked
+        first, about a request binding no tools and the parameters ``model_kwargs``
+        returns. Conjoining it is what keeps a capability predicate that answers
+        without consulting the schema from resolving a form its own connection has no
+        translation for; asking it first is what keeps that predicate and
+        ``effective_model_for`` from being consulted about such a form at all, which
+        matters because neither contract forbids an override from raising.
+
+        A ``True`` is not a promise that ``chat_structured`` returns a response: a
+        connection may still raise once its native branch has decided to apply the
+        schema, as happens where the caller supplied a response format of its own that
+        conflicts with it, or where the schema renders to no document the provider
+        will take. Such a failure is that connection's documented answer and reaches
+        the caller as it was raised.
+
+        Answers about a call rather than issuing one: this method sends no request.
+        What the connection's hooks do when consulted is their own contracts'
+        business.
+
+        Parameters
+        ----------
+        output_schema : OutputSchema | None
+            The schema a call would carry, or ``None`` for an unconstrained call,
+            which is never a native one.
+
+        Returns:
+        -------
+        bool
+            ``True`` if the connection reports such a call feasible and the configured
+            strategy, resolved against the connection's capability for the model its
+            own ``effective_model_for`` names for such a call, calls for a native
+            schema.
+
+        Raises:
+        ------
+        TypeError
+            If ``open()`` has not resolved the connection yet.
+        ValueError
+            If the configured strategy is ``NATIVE`` and the connection could not
+            apply this schema to such a call at all, which no provider error could
+            report because no request expresses it.
+        """
+        connection = self._get_connection()
+        if output_schema is None:
+            return False
+
+        model_kwargs = self.model_kwargs
+        if not connection.can_apply_native_structured_output(
+            output_schema, [], model_kwargs
+        ):
+            if self.structured_output_strategy is StructuredOutputStrategy.NATIVE:
+                # The wrapped shape rather than the wrapper, which renders the same
+                # for every schema it carries and would leave a user unable to tell
+                # which one was rejected.
+                inner = output_schema.output_schema
+                shape = (
+                    f"{inner.__module__}.{inner.__qualname__}"
+                    if isinstance(inner, type)
+                    else str(inner)
+                )
+                cls = type(connection)
+                err_msg = (
+                    "Structured output strategy NATIVE was requested, but"
+                    f" {cls.__module__}.{cls.__qualname__} reports the output schema"
+                    f" {shape} infeasible: no request it builds can carry that"
+                    " schema. Use AUTO or PROMPT to describe the schema in the prompt"
+                    " instead, or supply a schema this connection can translate."
+                )
+                raise ValueError(err_msg)
+            return False
+
+        return self.structured_output_strategy.resolves_to_native(
+            connection.supports_native_structured_output(
+                connection.effective_model_for(model_kwargs)
+            )
+        )
+
+    def chat_structured(
+        self,
+        messages: Sequence[ChatMessage],
+        output_schema: OutputSchema,
+        **kwargs: Any,
+    ) -> ChatMessage:
+        """Issue one schema-carrying call, binding no tools and leaving the bound
+        prompt out of the messages, so that the schema is the request's only
+        description of the shape the answer should take.
+
+        Framework-facing rather than a user entry point. It serves the caller that has
+        already decided, through ``will_apply_native_structured_output``, that the
+        schema should travel natively; a user reaches a model through ``chat``, which
+        is where a prompt, prompt arguments and tools belong.
+
+        The messages are sent as given. ``chat`` prepends the bound prompt whenever
+        one is bound, whatever prompt arguments it is handed, so a second pass over
+        messages that already came through it would repeat that prompt and the
+        skill-discovery message with it. Binding no tools is not a caller's choice
+        either: a provider may drop a native schema from a request that also
+        advertises tools.
+
+        A schema is required. A connection reads a missing one as an unconstrained
+        request, so without this check the one method whose purpose is to carry a
+        schema would quietly answer without one; ``chat`` is how a caller asks for
+        that deliberately.
+
+        A connection may raise from here once its native branch has decided to apply
+        the schema, as happens where the caller supplied a response format of its own
+        that conflicts with it. Such a failure reaches the caller as it was raised
+        rather than becoming an unconstrained response, so what this may raise is not
+        limited to the errors listed below.
+
+        Parameters
+        ----------
+        messages : Sequence[ChatMessage]
+            The conversation to send, used as given.
+        output_schema : OutputSchema
+            The schema the call carries, which must not be ``None``.
+        **kwargs : Any
+            Parameters for this call alone, merged over ``model_kwargs`` the same way
+            ``chat`` merges them.
+
+        Returns:
+        -------
+        ChatMessage
+            The connection's response.
+
+        Raises:
+        ------
+        TypeError
+            If ``output_schema`` is ``None``, or if ``open()`` has not resolved the
+            connection yet.
+        NotImplementedError
+            If the connection has no native structured-output translation.
+        """
+        connection = self._get_connection()
+        if output_schema is None:
+            err_msg = (
+                "chat_structured() requires an output schema, which is the one thing"
+                " it exists to carry. Call chat() for an unconstrained request."
+            )
+            raise TypeError(err_msg)
+
+        merged_kwargs = self.model_kwargs.copy()
+        merged_kwargs.update(kwargs)
+        return connection.chat(
+            messages, tools=[], output_schema=output_schema, **merged_kwargs
+        )
 
     def _record_token_metrics(
         self,
