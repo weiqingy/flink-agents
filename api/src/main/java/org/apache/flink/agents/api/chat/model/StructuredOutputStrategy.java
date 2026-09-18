@@ -26,7 +26,10 @@ import java.util.Locale;
  * <p>This expresses <b>policy</b> only. Whether a connection <i>can</i> apply the provider's native
  * structured-output API is a separate, model-dependent <b>capability</b> question answered by
  * {@link BaseChatModelConnection#supportsNativeStructuredOutput(String)}. {@link
- * #resolvesToNative(boolean)} combines the two.
+ * #resolvesToNative(boolean)} combines this policy with the connection's model-dependent
+ * capability, and {@link BaseChatModelSetup#willApplyNativeStructuredOutput(Object)} is what
+ * decides a request: it asks the connection whether the schema is feasible at all before consulting
+ * that resolver.
  */
 public enum StructuredOutputStrategy {
     /**

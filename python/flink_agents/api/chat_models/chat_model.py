@@ -41,7 +41,11 @@ class StructuredOutputStrategy(str, Enum):
 
     This expresses *policy* only. Whether a connection *can* apply the provider's
     native structured-output API is a separate, model-dependent *capability*
-    question. ``resolves_to_native`` combines the two.
+    question. ``resolves_to_native`` combines this policy with the connection's
+    model-dependent capability, and
+    ``BaseChatModelSetup.will_apply_native_structured_output`` is what decides a
+    request: it asks the connection whether the schema is feasible at all before
+    consulting that resolver.
 
     Inherits from ``str`` so the value survives the JSON-carried bridge to Java.
     Java serializes this enum as its *name* ("NATIVE") while the value here is
@@ -455,7 +459,10 @@ class BaseChatModelSetup(Resource):
         description=(
             "Intent about how an output schema should be applied. "
             "``resolves_to_native`` combines this policy with the "
-            "connection's model-dependent capability. An explicitly null value is "
+            "connection's model-dependent capability, and "
+            "``will_apply_native_structured_output`` is what decides a request: it "
+            "asks the connection whether the schema is feasible at all before "
+            "consulting that resolver. An explicitly null value is "
             "normalized to AUTO, so a validated setup always carries a real strategy."
         ),
     )

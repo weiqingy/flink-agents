@@ -63,14 +63,14 @@ public abstract class BaseChatModelConnection extends Resource {
      * name the user chose while capability belongs to the model backing it, so the two disagree in
      * both directions.
      *
-     * <p>The default {@code false} keeps a connection on the prompt-engineering fallback. A
-     * connection that classifies by model name must still report {@code false} for a name it does
-     * not recognize. What that buys depends on the configured strategy rather than on this
-     * connection: under {@code AUTO} or {@code PROMPT} it degrades to the fallback rather than
-     * failing at the provider, while under a forced {@code NATIVE} the schema is sent anyway and
-     * the provider answers for it. A connection whose capability belongs to the endpoint rather
-     * than to the model answers for the endpoint instead, and may report {@code true} for a name it
-     * has never seen.
+     * <p>The default {@code false} keeps a connection on the prompt-engineering fallback wherever
+     * the configured strategy defers to capability. A connection that classifies by model name must
+     * still report {@code false} for a name it does not recognize. What that buys depends on the
+     * configured strategy rather than on this connection: under {@code AUTO} or {@code PROMPT} it
+     * degrades to the fallback rather than failing at the provider, while under a forced {@code
+     * NATIVE} the schema is sent anyway and the provider answers for it. A connection whose
+     * capability belongs to the endpoint rather than to the model answers for the endpoint instead,
+     * and may report {@code true} for a name it has never seen.
      *
      * <p>This answer is advisory rather than binding: it is a statement about the model that a
      * configured policy is permitted to overrule, and {@link
