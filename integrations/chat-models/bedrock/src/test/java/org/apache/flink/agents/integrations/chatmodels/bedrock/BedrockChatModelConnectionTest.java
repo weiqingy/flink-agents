@@ -146,31 +146,24 @@ class BedrockChatModelConnectionTest {
     }
 
     @Test
-    @DisplayName("the model the request builder judges is the one the hook names")
-    void testEffectiveModelForNamesTheModelTheBuilderJudges() {
-        // The hook duplicates resolveModel rather than calling it, so only capturing what the
-        // builder feeds the predicate keeps the two from drifting apart.
-        AtomicReference<String> judged = new AtomicReference<>();
-        BedrockChatModelConnection connection =
-                new BedrockChatModelConnection(
-                        descriptor("us-east-1", "us.anthropic.claude-sonnet-4-20250514-v1:0"),
-                        NOOP) {
-                    @Override
-                    protected boolean supportsNativeStructuredOutput(String effectiveModel) {
-                        judged.set(effectiveModel);
-                        return super.supportsNativeStructuredOutput(effectiveModel);
-                    }
-                };
+    @DisplayName("the model the hook names is the model the built request is issued against")
+    void testEffectiveModelForNamesTheModelTheRequestIssues() {
+        // The hook duplicates resolveModel rather than calling it, so the two can drift. The branch
+        // no longer consults the capability predicate, so the binding is taken against the model id
+        // the request carries: were they to diverge, the gate would judge one model while the call
+        // went to another.
+        BedrockChatModelConnection connection = connection();
 
         for (Map<String, Object> modelParams :
                 List.<Map<String, Object>>of(
                         params("qwen.qwen3-32b-v1:0"), params("   "), new HashMap<>())) {
             String named = connection.effectiveModelFor(modelParams);
 
-            connection.buildRequest(
-                    List.of(ChatMessage.user("hello")), null, modelParams, Profile.class);
+            ConverseRequest request =
+                    connection.buildRequest(
+                            List.of(ChatMessage.user("hello")), null, modelParams, Profile.class);
 
-            assertThat(judged.get()).isEqualTo(named);
+            assertThat(request.modelId()).isEqualTo(named);
         }
     }
 
@@ -647,8 +640,10 @@ class BedrockChatModelConnectionTest {
     }
 
     private static Stream<Arguments> gateFailures() {
+        // The incapable-model case is deliberately absent: capability no longer gates this branch,
+        // and that a schema now reaches an undocumented model is pinned by the capability-exclusion
+        // test below.
         return Stream.of(
-                Arguments.of(INCAPABLE_MODEL, Profile.class),
                 Arguments.of(CAPABLE_MODEL, null),
                 // A RowTypeInfo schema arrives wrapped rather than as a bare Class and has no
                 // native translation here, so it degrades to the fallback rather than failing.
@@ -659,7 +654,7 @@ class BedrockChatModelConnectionTest {
 
     @ParameterizedTest
     @MethodSource("gateFailures")
-    @DisplayName("the native path is skipped for an incapable model or a non-POJO schema")
+    @DisplayName("the native path is skipped for a schema form this connection cannot translate")
     void testNativeSchemaSkippedWhenGateFails(String model, Object outputSchema) {
         assertThat(
                         connection()
@@ -726,9 +721,8 @@ class BedrockChatModelConnectionTest {
     @DisplayName("the feasibility query leaves the model's capability out of its answer")
     void testFeasibilityQueryExcludesModelCapability() {
         // Feasibility and capability are independent: a POJO is feasible here even on a model AWS
-        // does not document support for, and the branch's own capability conjunct is what keeps
-        // that request unconstrained. An override that folded capability in would make this pair
-        // agree, which the binding test cannot see because it moves both sides at once.
+        // does not document support for. The branch is now exactly this query, so that request
+        // carries the schema as well, and capability is the gate's business alone.
         Map<String, Object> incapable = params(INCAPABLE_MODEL);
 
         assertThat(connection().canApplyNativeStructuredOutput(Profile.class, null, incapable))
@@ -741,7 +735,7 @@ class BedrockChatModelConnectionTest {
                                         incapable,
                                         Profile.class)
                                 .outputConfig())
-                .isNull();
+                .isNotNull();
     }
 
     @Test

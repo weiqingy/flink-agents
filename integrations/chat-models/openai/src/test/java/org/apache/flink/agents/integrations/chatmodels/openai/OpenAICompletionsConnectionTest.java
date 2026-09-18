@@ -21,6 +21,7 @@ package org.apache.flink.agents.integrations.chatmodels.openai;
 import com.fasterxml.jackson.annotation.JsonSubTypes;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import com.openai.errors.BadRequestException;
+import com.openai.models.ChatModel;
 import com.openai.models.ResponseFormatJsonSchema;
 import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import org.apache.flink.agents.api.chat.messages.ChatMessage;
@@ -310,21 +311,24 @@ class OpenAICompletionsConnectionTest {
     }
 
     @Test
-    @DisplayName("Native NOT applied for a POJO on an incapable model (prompt fallback)")
-    void testNativeNotAppliedForIncapableModel() {
+    @DisplayName("Native applied for a POJO on an incapable model, so the provider answers")
+    void testNativeAppliedForIncapableModel() {
+        // Capability no longer gates this branch: a caller that asked for a schema gets one on the
+        // wire, and a model that cannot honor it says so, rather than the request being quietly
+        // unconstrained.
         ChatCompletionCreateParams params =
                 connection()
                         .buildRequest(
                                 userMessage(), List.of(), params("gpt-3.5-turbo"), Person.class);
 
-        assertThat(params.responseFormat()).isEmpty();
+        assertThat(params.responseFormat()).isPresent();
     }
 
     @Test
-    @DisplayName("Native NOT applied for a pre-cutoff same-family gpt-4o snapshot")
-    void testNativeNotAppliedForPreCutoffSnapshot() {
+    @DisplayName("Native applied for a pre-cutoff same-family gpt-4o snapshot")
+    void testNativeAppliedForPreCutoffSnapshot() {
         // gpt-4o-2024-05-13 predates the Structured Outputs cutoff even though it shares the gpt-4o
-        // prefix; treating it as capable would fail silently at the provider.
+        // prefix. That is now the provider's objection to raise, not a reason to withhold here.
         ChatCompletionCreateParams params =
                 connection()
                         .buildRequest(
@@ -333,7 +337,7 @@ class OpenAICompletionsConnectionTest {
                                 params("gpt-4o-2024-05-13"),
                                 Person.class);
 
-        assertThat(params.responseFormat()).isEmpty();
+        assertThat(params.responseFormat()).isPresent();
     }
 
     @Test
@@ -356,35 +360,24 @@ class OpenAICompletionsConnectionTest {
     }
 
     @Test
-    @DisplayName("The model the request builder judges is the one the hook names")
-    void testEffectiveModelForNamesTheModelTheBuilderJudges() {
+    @DisplayName("The model the hook names is the model the built request is issued against")
+    void testEffectiveModelForNamesTheModelTheRequestIssues() {
         // The hook duplicates the builder's own model resolution rather than centralizing it, so
-        // capturing what the builder actually feeds the predicate is the only thing that keeps the
-        // two from drifting apart. Asserting each against a literal would let them drift in step.
-        AtomicReference<String> judged = new AtomicReference<>();
-        OpenAICompletionsConnection connection =
-                new OpenAICompletionsConnection(
-                        ResourceDescriptor.Builder.newBuilder(
-                                        OpenAICompletionsConnection.class.getName())
-                                .addInitialArgument("api_key", "test-key")
-                                .addInitialArgument("model", "gpt-4o")
-                                .build(),
-                        NOOP) {
-                    @Override
-                    protected boolean supportsNativeStructuredOutput(String effectiveModel) {
-                        judged.set(effectiveModel);
-                        return super.supportsNativeStructuredOutput(effectiveModel);
-                    }
-                };
+        // the two can drift. The branch no longer consults the capability predicate, so the binding
+        // is taken against the model the request names: were they to diverge, the gate would judge
+        // one model while the call went to another. Asserting each against a literal would let them
+        // drift in step.
+        OpenAICompletionsConnection connection = connection();
 
         for (Map<String, Object> modelParams :
                 List.<Map<String, Object>>of(
                         params("gpt-4o-mini"), params("   "), new HashMap<>())) {
             String named = connection.effectiveModelFor(modelParams);
 
-            connection.buildRequest(userMessage(), List.of(), modelParams, Person.class);
+            ChatCompletionCreateParams request =
+                    connection.buildRequest(userMessage(), List.of(), modelParams, Person.class);
 
-            assertThat(judged.get()).isEqualTo(named);
+            assertThat(request.model()).isEqualTo(ChatModel.of(named));
         }
     }
 
@@ -531,9 +524,8 @@ class OpenAICompletionsConnectionTest {
     @DisplayName("The feasibility query leaves the model's capability out of its answer")
     void testFeasibilityQueryExcludesModelCapability() {
         // The two answers are independent: a POJO is feasible here even on a model the allowlist
-        // rejects, and it is the branch's separate capability conjunct that keeps that request
-        // unconstrained. An override that folded capability in would make this pair agree, which
-        // the binding test above cannot see because it moves both sides at once.
+        // rejects. The branch is now exactly this query, so that request carries the schema as
+        // well, and capability is the gate's business alone.
         Map<String, Object> incapable = params("gpt-4o-2024-05-13");
 
         assertThat(connection().canApplyNativeStructuredOutput(Person.class, List.of(), incapable))
@@ -542,7 +534,7 @@ class OpenAICompletionsConnectionTest {
                         connection()
                                 .buildRequest(userMessage(), List.of(), incapable, Person.class)
                                 .responseFormat())
-                .isEmpty();
+                .isPresent();
     }
 
     @Test

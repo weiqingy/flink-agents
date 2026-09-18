@@ -202,9 +202,9 @@ public abstract class BaseChatModelSetup extends Resource {
     }
 
     /**
-     * Whether {@code outputSchema} should travel through the provider's native structured output on
-     * a call issued through {@link #chatStructured(List, Map, Object)}, rather than be described to
-     * the model in the prompt.
+     * Whether a call issued through {@link #chatStructured(List, Map, Object)} would carry {@code
+     * outputSchema} to the provider as a native schema, rather than leave it to be described to the
+     * model in the prompt.
      *
      * <p>Framework-facing rather than a user entry point. It is public because the caller that has
      * to choose between those two channels lives outside this package; a user configures the
@@ -221,11 +221,20 @@ public abstract class BaseChatModelSetup extends Resource {
      * consulted about such a form at all, which matters because neither contract forbids an
      * override from raising.
      *
+     * <p>A {@code true} says what such a call carries, not merely which of the two channels was
+     * chosen for it. A connection's native branch is exactly the feasibility query composed here,
+     * asked about the same tool-free request and the same {@link #getParameters()} map, so a
+     * request that query reports feasible is one whose native schema parameter the connection
+     * writes. Per-call parameters are the limit of that: {@link #chatStructured(List, Map, Object)}
+     * merges them over {@link #getParameters()}, so a caller that adds one its connection reads for
+     * feasibility can be answered here about a different request from the one it goes on to build.
+     *
      * <p>A {@code true} is not a promise that {@link #chatStructured(List, Map, Object)} returns a
      * response: a connection may still raise once its native branch has decided to apply the
      * schema, as happens where the caller supplied a response format of its own that conflicts with
      * it. Such a failure is that connection's documented answer and reaches the caller as it was
-     * raised.
+     * raised. Nor is it a promise about the reply: what a provider does with a schema it was sent
+     * is the provider's own business.
      *
      * <p>Answers about a call rather than issuing one: this method sends no request. What the
      * connection's hooks do when consulted is their own contracts' business.
@@ -306,7 +315,10 @@ public abstract class BaseChatModelSetup extends Resource {
      *
      * @param messages the conversation to send, used as given
      * @param modelParams parameters for this call alone, merged over {@link #getParameters()} the
-     *     same way {@link #chat(List, Map, Map)} merges them, may be null
+     *     same way {@link #chat(List, Map, Map)} merges them, may be null. {@link
+     *     #willApplyNativeStructuredOutput(Object)} is answered about {@link #getParameters()}
+     *     alone, so a parameter supplied here that its connection reads when judging feasibility
+     *     makes this call differ from the one that gate answered about
      * @param outputSchema the schema the call carries, which must not be null
      * @return the connection's response
      * @throws UnsupportedOperationException if the connection has no native translation for {@code

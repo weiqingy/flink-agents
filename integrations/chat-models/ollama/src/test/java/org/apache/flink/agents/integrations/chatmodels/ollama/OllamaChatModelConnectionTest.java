@@ -347,6 +347,33 @@ class OllamaChatModelConnectionTest {
         assertThat(phases).containsExactlyInAnyOrder(Phase.values());
     }
 
+    @Test
+    @DisplayName("A schema is sent even when the connection reports the model incapable")
+    void buildRequestSetsFormatWhenTheModelIsReportedIncapable() {
+        // This connection reports every model capable, so the only way to reach the case is to
+        // override the predicate. The branch no longer consults it, so the schema travels anyway
+        // and the server is what answers for it. Without this, nothing here would notice a
+        // capability conjunct being reintroduced.
+        ResourceDescriptor desc =
+                ResourceDescriptor.Builder.newBuilder(OllamaChatModelConnection.class.getName())
+                        .addInitialArgument("endpoint", "http://localhost:11434")
+                        .build();
+        OllamaChatModelConnection reportsIncapable =
+                new OllamaChatModelConnection(desc, NOOP) {
+                    @Override
+                    protected boolean supportsNativeStructuredOutput(String effectiveModel) {
+                        return false;
+                    }
+                };
+
+        OllamaChatRequest request =
+                reportsIncapable.buildRequest(
+                        userMessage(), List.of(), params("qwen3:4b"), Report.class);
+
+        assertThat(request.getFormat()).isInstanceOf(JsonNode.class);
+        assertThat(((JsonNode) request.getFormat()).path("type").asText()).isEqualTo("object");
+    }
+
     @ParameterizedTest
     @NullAndEmptySource
     @ValueSource(strings = {"qwen3:4b", "llama3.2", "gpt-oss:20b", "some-private-local-model"})

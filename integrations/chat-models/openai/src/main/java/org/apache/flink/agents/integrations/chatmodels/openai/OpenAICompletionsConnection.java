@@ -146,11 +146,12 @@ public class OpenAICompletionsConnection extends BaseChatModelConnection {
     // temporal rather than nominal. The o1 family is not uniform: o1 is capable while o1-mini is
     // not, so an "o1" prefix would admit an incapable sibling.
     //
-    // A name outside every listed family reports not-capable and degrades to the prompt fallback
-    // rather than failing at the provider. Within a listed family the prefix assumes capability,
-    // so a family variant that ships without json_schema support has to be excluded explicitly,
-    // either by a marker that appears in no capable name or by replacing the family prefix with
-    // exact names.
+    // A name outside every listed family reports not-capable. Under AUTO or PROMPT that degrades to
+    // the prompt fallback rather than failing at the provider; under a forced NATIVE the schema is
+    // sent regardless and the provider answers for it. Within a listed family the prefix assumes
+    // capability, so a family variant that ships without json_schema support has to be excluded
+    // explicitly, either by a marker that appears in no capable name or by replacing the family
+    // prefix with exact names.
     private static final Set<String> NON_TEXT_MODALITY_MARKERS =
             Set.of("-audio", "-realtime", "-tts", "-transcribe");
     private static final Set<String> NATIVE_STRUCTURED_OUTPUT_FAMILY_PREFIXES =
@@ -189,7 +190,7 @@ public class OpenAICompletionsConnection extends BaseChatModelConnection {
      * effective model's capability aside.
      *
      * <p>Only a POJO {@link Class} has a native translation here; a {@code RowTypeInfo} wrapped in
-     * {@code OutputSchema}, or any other form, has none and keeps the prompt-engineering fallback.
+     * {@code OutputSchema}, or any other form, has none, and the request carries no derived schema.
      * Nothing else about the request constrains the native branch, so neither the tools nor the
      * parameters are read: this connection sends a native schema alongside bound tools, and the one
      * parameter that would matter is the model, which is the capability question this excludes.
@@ -292,16 +293,17 @@ public class OpenAICompletionsConnection extends BaseChatModelConnection {
             builder.tools(convertTools(tools, strictMode));
         }
 
-        // Native structured output applies only for a POJO Class schema on a model the provider
-        // documents as capable; a RowTypeInfo (wrapped in OutputSchema) or an incapable model keeps
-        // the prompt-engineering fallback.
+        // Native structured output applies only for a POJO Class schema; a RowTypeInfo (wrapped in
+        // OutputSchema) carries no derived schema, and what that means for the caller is its
+        // strategy's to decide rather than this branch's.
         //
-        // The feasibility half is asked rather than restated, so a caller asking the same question
-        // gets the answer this branch acts on. It is asked with the parameters as they arrived,
-        // not the stripped copy above, so that an override reading a parameter sees the request
-        // the answer is about.
-        if (canApplyNativeStructuredOutput(outputSchema, tools, rawModelParams)
-                && supportsNativeStructuredOutput(modelName)) {
+        // The branch is exactly the feasibility query, so a caller asking the same question gets
+        // the answer this branch acts on. It is asked with the parameters as they arrived, not the
+        // stripped copy above, so that an override reading a parameter sees the request the answer
+        // is about. Whether the model is one the provider documents as capable is not asked here:
+        // a caller that hands this connection a schema has already decided to send one, and
+        // re-checking would drop it from the request the caller asked to carry it.
+        if (canApplyNativeStructuredOutput(outputSchema, tools, rawModelParams)) {
             builder.responseFormat(toNativeResponseFormat((Class<?>) outputSchema));
         }
 

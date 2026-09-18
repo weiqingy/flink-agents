@@ -32,9 +32,12 @@ import java.util.Optional;
  *
  * <p>{@code model} (inherited from {@link BaseChatModelSetup}) is the Azure deployment name, not
  * the underlying OpenAI model name. The underlying model name can be supplied via {@code
- * model_of_azure_deployment}. It labels token-usage metrics, and it is also the name that decides
- * whether a request can carry a native structured-output schema, since the deployment name carries
- * no model information. Leaving it unset keeps requests on the prompt-engineering fallback.
+ * model_of_azure_deployment}. It labels token-usage metrics, and it is also the name whose
+ * capability decides whether a request should carry a native structured-output schema, since the
+ * deployment name carries no model information. Leaving it unset makes that capability answer
+ * {@code false}, and what follows is the configured strategy's to decide: under {@code AUTO} or
+ * {@code PROMPT} requests stay on the prompt-engineering fallback, while under a forced {@code
+ * NATIVE} the schema is sent anyway and the provider answers for it.
  *
  * <p>Example usage:
  *

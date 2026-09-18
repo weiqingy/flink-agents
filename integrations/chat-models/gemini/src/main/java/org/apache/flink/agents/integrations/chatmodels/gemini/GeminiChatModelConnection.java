@@ -123,8 +123,9 @@ public class GeminiChatModelConnection extends BaseChatModelConnection {
     // rejects.
     //
     // A name outside the family — a Gemma model served by the same endpoint, a tuned model, or a
-    // path-qualified form such as models/gemini-2.5-flash — reports not-capable and degrades to the
-    // prompt fallback rather than failing at the provider.
+    // path-qualified form such as models/gemini-2.5-flash — reports not-capable. Under AUTO or
+    // PROMPT that degrades to the prompt fallback rather than failing at the provider; under a
+    // forced NATIVE the schema is sent regardless and the provider answers for it.
     private static final String NATIVE_STRUCTURED_OUTPUT_FAMILY_PREFIX = "gemini-";
     private static final Set<String> NON_TEXT_MODALITY_MARKERS =
             Set.of("-image", "-tts", "-audio", "-live", "-transcribe", "-embedding", "-omni");
@@ -203,10 +204,10 @@ public class GeminiChatModelConnection extends BaseChatModelConnection {
     /**
      * Whether Google documents native structured output for {@code effectiveModel}.
      *
-     * <p>A {@code true} means the request carries the schema as a native {@code responseJsonSchema}
-     * and the model is one Google documents as accepting one. What that buys is structural
-     * conformance: the response is syntactically valid JSON whose object shape, key set and value
-     * types follow the schema as the service interpreted it.
+     * <p>A {@code true} means the model is one Google documents as accepting a native {@code
+     * responseJsonSchema}. What a request carrying one buys is structural conformance: the response
+     * is syntactically valid JSON whose object shape, key set and value types follow the schema as
+     * the service interpreted it.
      *
      * <p>It does not buy conformance to every constraint the schema expresses. Gemini supports a
      * subset of JSON Schema and ignores the keywords outside that subset, server-side, without
@@ -220,7 +221,12 @@ public class GeminiChatModelConnection extends BaseChatModelConnection {
      * the provider with {@code 400 INVALID_ARGUMENT}, "JSON mode is not enabled for this model",
      * rather than degrading quietly. A name outside the family — a Gemma model on the same
      * endpoint, a tuned model, or the path-qualified {@code models/gemini-2.5-flash} form the SDK
-     * also accepts — reports not-capable and keeps the prompt-engineering fallback.
+     * also accepts — reports not-capable.
+     *
+     * <p>What follows from a not-capable report is the caller's to decide rather than this
+     * connection's: the config builder does not consult this answer, so the prompt-engineering
+     * fallback governs only where the configured strategy resolves on it, and a forced {@code
+     * NATIVE} sends the schema regardless.
      */
     @Override
     protected boolean supportsNativeStructuredOutput(String effectiveModel) {
@@ -289,10 +295,12 @@ public class GeminiChatModelConnection extends BaseChatModelConnection {
 
     /**
      * Translates {@code outputSchema} into Gemini's native {@code responseJsonSchema} when it is a
-     * POJO {@link Class}, the request carries no tools, and the effective model is one Google
-     * documents structured-output support for. Any other combination sends no derived schema, so a
-     * schema that cannot be sent natively degrades to the prompt-engineering fallback rather than
-     * failing at the provider.
+     * POJO {@link Class} and the request carries no tools. Any other combination sends no derived
+     * schema. What that buys depends on the configured strategy rather than on this connection:
+     * under {@code AUTO} or {@code PROMPT} a schema that cannot be sent natively degrades to the
+     * prompt-engineering fallback rather than failing at the provider, while under a forced {@code
+     * NATIVE} it fails fast at the gate before a request is built. Whether the effective model is
+     * one Google documents structured-output support for is not asked here.
      *
      * <p>The tools condition is a provider constraint rather than a preference: outside a
      * documented preview, Gemini answers a request that combines function declarations with a JSON
@@ -383,9 +391,21 @@ public class GeminiChatModelConnection extends BaseChatModelConnection {
         return map;
     }
 
-    // Package-visible for unit testing of the request-config assembly. modelName is passed
-    // explicitly rather than read from arguments, because chat() has already resolved it against
-    // the connection's default by this point.
+    // Package-visible for unit testing of the request-config assembly. modelName is the model
+    // chat() resolved for the call, passed explicitly rather than read from arguments because
+    // chat() has already resolved it against the connection's default by this point.
+    //
+    // The config assembled here no longer reads it, since whether that model is capable is not
+    // decided in this connection any more. Passing it is therefore not what ties the hook to the
+    // wire: this parameter agreeing with effectiveModelFor would say nothing about the model
+    // generateContent is actually called with, and a mutant that changes one without the other
+    // proves it. That binding is taken from the request line against a local stub instead.
+    //
+    // It stays on the signature as a tripwire rather than as coverage. Nothing in this method
+    // references it, so a test varying it cannot fail on that account and proves nothing about the
+    // emitted config today. What it does is keep the model within reach here, so that reintroducing
+    // a read of it is a visible edit to this branch rather than a new parameter that quietly
+    // restores the capability check this commit removed.
     //
     // arguments is the caller's parameter map and is not consumed: the keys recognized here are
     // taken from a copy, so the map stays whole for the feasibility query below, which has to be
@@ -427,16 +447,19 @@ public class GeminiChatModelConnection extends BaseChatModelConnection {
         }
 
         // Native structured output applies only for a POJO Class schema; any other schema form,
-        // such as a RowTypeInfo wrapped in OutputSchema, keeps the prompt-engineering fallback.
+        // such as a RowTypeInfo wrapped in OutputSchema, carries no derived schema, and what that
+        // means for the caller is its strategy's to decide rather than this branch's.
         // Nothing above writes either field this branch sets: the keys read directly are
         // temperature and max_output_tokens, and applyAdditionalKwargs recognizes only top_k,
         // top_p and stop_sequences, so there is no caller-supplied value to collide with.
         //
-        // The schema form and the empty-tools precondition are asked rather than restated, so a
-        // caller asking the same question gets the answer this branch acts on. Asked with the
-        // caller's parameters rather than the consumed copy, so both ask about the same map.
-        if (canApplyNativeStructuredOutput(outputSchema, tools, arguments)
-                && supportsNativeStructuredOutput(modelName)) {
+        // The branch is exactly the feasibility query, so a caller asking the same question gets
+        // the answer this branch acts on. Asked with the caller's parameters rather than the
+        // consumed copy, so both ask about the same map. Whether the model is one Google documents
+        // support for is not asked here: a caller that hands this connection a schema has already
+        // decided to send one, and re-checking would drop it from the request the caller asked to
+        // carry it.
+        if (canApplyNativeStructuredOutput(outputSchema, tools, arguments)) {
             builder.responseMimeType("application/json");
             builder.responseJsonSchema(toNativeJsonSchema((Class<?>) outputSchema));
         }

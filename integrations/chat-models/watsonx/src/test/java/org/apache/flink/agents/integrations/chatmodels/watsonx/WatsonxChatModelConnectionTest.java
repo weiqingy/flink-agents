@@ -795,6 +795,34 @@ class WatsonxChatModelConnectionTest {
     }
 
     @Test
+    @DisplayName("A schema is sent even when the connection reports the model incapable")
+    void buildPayloadWritesResponseFormatWhenTheModelIsReportedIncapable() {
+        // This connection reports every model capable, so the only way to reach the case is to
+        // override the predicate. The branch no longer consults it, so the schema travels anyway
+        // and the endpoint is what answers for it. Without this, nothing here would notice a
+        // capability conjunct being reintroduced.
+        WatsonxChatModelConnection reportsIncapable =
+                new WatsonxChatModelConnection(
+                        descriptor("https://us-south.ml.cloud.ibm.com", "test-key", "test-project"),
+                        NOOP,
+                        NO_ENVIRONMENT) {
+                    @Override
+                    protected boolean supportsNativeStructuredOutput(String effectiveModel) {
+                        return false;
+                    }
+                };
+
+        ObjectNode payload =
+                reportsIncapable.buildPayload(
+                        List.of(new ChatMessage(MessageRole.USER, "Hello!")),
+                        List.of(),
+                        Map.of("model", MODEL),
+                        Report.class);
+
+        assertThat(payload.path("response_format").path("type").asText()).isEqualTo("json_schema");
+    }
+
+    @Test
     @DisplayName("No output schema leaves the payload without a response format")
     void buildPayloadOmitsResponseFormatWithoutSchema() {
         ObjectNode payload = payloadFor(null);

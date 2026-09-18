@@ -64,10 +64,13 @@ public abstract class BaseChatModelConnection extends Resource {
      * both directions.
      *
      * <p>The default {@code false} keeps a connection on the prompt-engineering fallback. A
-     * connection that classifies by model name must report {@code false} for a name it does not
-     * recognize, so that it degrades to the fallback rather than failing at the provider. A
-     * connection whose capability belongs to the endpoint rather than to the model answers for the
-     * endpoint instead, and may report {@code true} for a name it has never seen.
+     * connection that classifies by model name must still report {@code false} for a name it does
+     * not recognize. What that buys depends on the configured strategy rather than on this
+     * connection: under {@code AUTO} or {@code PROMPT} it degrades to the fallback rather than
+     * failing at the provider, while under a forced {@code NATIVE} the schema is sent anyway and
+     * the provider answers for it. A connection whose capability belongs to the endpoint rather
+     * than to the model answers for the endpoint instead, and may report {@code true} for a name it
+     * has never seen.
      *
      * <p>This answer is advisory rather than binding: it is a statement about the model that a
      * configured policy is permitted to overrule, and {@link
@@ -132,16 +135,19 @@ public abstract class BaseChatModelConnection extends Resource {
      * native branch, so that the answer cannot drift from what the request ends up carrying.
      *
      * <p>A {@code false} answer is not an error: it reports that the request would carry no native
-     * schema, so the caller keeps the prompt-engineering fallback rather than losing the schema. A
-     * {@code true} is not a promise that the call succeeds either: a connection may still raise
-     * once its native branch has decided to apply the schema, as happens where the caller supplied
-     * a response format of its own that conflicts with it.
+     * schema. What the caller does with that is the configured strategy's to decide — under {@code
+     * AUTO} or {@code PROMPT} it keeps the prompt-engineering fallback rather than losing the
+     * schema, while under a forced {@code NATIVE} the gate raises rather than falling back, since
+     * no request it builds could express the schema. A {@code true} is not a promise that the call
+     * succeeds either: a connection may still raise once its native branch has decided to apply the
+     * schema, as happens where the caller supplied a response format of its own that conflicts with
+     * it.
      *
      * <p>The default {@code false} is safe only for a connection that translates no schema at all.
      * A connection whose request builder has a native branch but which leaves this unoverridden
-     * reports every request infeasible: a caller that degrades to the prompt-engineering fallback
-     * then silently never reaches that branch, and one that refuses an unapplicable schema instead
-     * fails on a request the connection could in fact have applied.
+     * reports every request infeasible: a caller that falls back to the prompt then silently never
+     * reaches that branch, and one that refuses an unapplicable schema instead fails on a request
+     * the connection could in fact have applied.
      *
      * <p>Answers about the request rather than validating it. A null {@code outputSchema} is an
      * unconstrained request, a null {@code tools} is a request binding no tools, and a null {@code
@@ -190,11 +196,13 @@ public abstract class BaseChatModelConnection extends Resource {
      * <p>No connection translates an {@link org.apache.flink.agents.api.agents.OutputSchema}, and
      * so a {@code RowTypeInfo}, natively, and what follows differs by connection. One that
      * overrides this overload applies its native parameter only for a POJO {@link Class}, so it
-     * skips the {@code RowTypeInfo} and leaves the request unchanged, and the caller keeps the
-     * prompt-engineering fallback. One that does not override it rejects the {@code RowTypeInfo}
-     * through the default body above, which refuses every non-null schema alike. The skip is a
-     * deliberate, permanent fallback rather than a translation still to be written; the rejection
-     * is the separate case of a connection that could otherwise only drop the schema silently.
+     * skips the {@code RowTypeInfo} and leaves the request unchanged; whether the caller then keeps
+     * the prompt-engineering fallback or is refused depends on its configured strategy, since a
+     * forced {@code NATIVE} raises at the gate on a schema no request can express. One that does
+     * not override it rejects the {@code RowTypeInfo} through the default body above, which refuses
+     * every non-null schema alike. The skip is a deliberate, permanent fallback rather than a
+     * translation still to be written; the rejection is the separate case of a connection that
+     * could otherwise only drop the schema silently.
      *
      * <p>An overriding connection renders a POJO with its provider SDK's own schema generator, and
      * a render failure is not reported here because those generators produce a schema for every
@@ -228,7 +236,7 @@ public abstract class BaseChatModelConnection extends Resource {
                             + " has no native structured-output translation, so it cannot honor"
                             + " the given output schema. Override chat(List, List, Map, Object) to"
                             + " translate the schema natively, or pass no schema so the caller"
-                            + " applies the prompt-engineering fallback.");
+                            + " describes it in the prompt instead.");
         }
         return chat(messages, tools, modelParams);
     }

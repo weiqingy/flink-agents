@@ -139,8 +139,9 @@ public class AnthropicChatModelConnection extends BaseChatModelConnection {
     // to retain the minor version: "claude-opus-4" would capture claude-opus-4-1-20250805, which
     // predates the cutoff and is not capable.
     //
-    // A name outside both sets reports not-capable and degrades to the prompt-engineering
-    // fallback rather than failing at the provider.
+    // A name outside both sets reports not-capable. Under AUTO or PROMPT that degrades to the
+    // prompt-engineering fallback rather than failing at the provider; under a forced NATIVE the
+    // schema is sent regardless and the provider answers for it.
     private static final Set<String> NATIVE_STRUCTURED_OUTPUT_MODELS =
             Set.of(
                     "claude-opus-4-6",
@@ -161,8 +162,9 @@ public class AnthropicChatModelConnection extends BaseChatModelConnection {
      *
      * <p>See the allowlists above for the source of truth and for why a 4.5-generation alias also
      * matches the dated snapshot behind it while every other name is matched exactly. An
-     * unrecognized name reports {@code false} so that it degrades to the prompt-engineering
-     * fallback rather than failing at the provider.
+     * unrecognized name reports {@code false}; what follows is the configured strategy's to decide,
+     * degrading to the prompt-engineering fallback under {@code AUTO} or {@code PROMPT} and sending
+     * the schema anyway under a forced {@code NATIVE}.
      *
      * <p>Reads no instance state, so capability stays answerable independently of how the
      * connection was configured.
@@ -273,7 +275,8 @@ public class AnthropicChatModelConnection extends BaseChatModelConnection {
      * names withdraw it. The cost of that default runs the opposite way to {@link
      * #supportsNativeStructuredOutput}: a rejecting model this list has not caught up with is
      * prefilled and answered with a 400, where an unrecognized name on the structured-output path
-     * degrades silently to the prompt-engineering fallback instead.
+     * degrades silently to the prompt-engineering fallback instead under {@code AUTO} or {@code
+     * PROMPT}.
      */
     static boolean supportsJsonPrefill(String effectiveModel) {
         // Load-bearing: the list is an immutable Set, whose contains(null) throws rather than
@@ -447,11 +450,17 @@ public class AnthropicChatModelConnection extends BaseChatModelConnection {
 
     /**
      * Translates {@code outputSchema} into Anthropic's native {@code output_config.format} when it
-     * is a POJO {@link Class}, the effective model is one Anthropic documents structured-output
-     * support for, and the caller has not already supplied its own {@code output_config}. Any other
-     * combination sends no derived schema, so the request carries only the output configuration the
-     * caller supplied, if any, and a schema that cannot be sent natively degrades to the
-     * prompt-engineering fallback rather than failing at the provider.
+     * is a POJO {@link Class} and the caller has not already supplied its own {@code
+     * output_config}. Any other combination sends no derived schema, so the request carries only
+     * the output configuration the caller supplied, if any. What that buys depends on the
+     * configured strategy rather than on this connection: under {@code AUTO} or {@code PROMPT} a
+     * schema that cannot be sent natively degrades to the prompt-engineering fallback rather than
+     * failing at the provider, while under a forced {@code NATIVE} it fails fast at the gate before
+     * a request is built.
+     *
+     * <p>Whether the effective model is one Anthropic documents structured-output support for is
+     * not asked here, so a schema supplied for a model this connection does not classify as capable
+     * reaches the provider and is answered there rather than dropped in silence.
      *
      * <p>A request that ends up carrying an {@code output_config} — whether derived here or
      * supplied by the caller — also suppresses the {@code json_prefill} parameter, since Anthropic
@@ -568,17 +577,18 @@ public class AnthropicChatModelConnection extends BaseChatModelConnection {
         // an output_config without supplying any output schema for the native branch to look at.
         boolean callerSuppliedOutputConfig = carriesCallerOutputConfig(rawModelParams);
 
-        // Native structured output applies only for a POJO Class schema on a model Anthropic
-        // documents as capable; a RowTypeInfo (wrapped in OutputSchema) or an incapable model keeps
-        // the prompt-engineering fallback. A caller-supplied output_config is the caller being
-        // explicit about the exact parameter this branch writes, so it wins and the schema falls
-        // back to prompt engineering rather than the two competing on the same request.
+        // Native structured output applies only for a POJO Class schema; a RowTypeInfo (wrapped in
+        // OutputSchema) carries no derived output_config. A caller-supplied output_config is the
+        // caller being explicit about the exact parameter this branch writes, so it wins and no
+        // derived one is added rather than the two competing on the same request. What either skip
+        // means for the caller is its strategy's to decide, not this branch's.
         //
-        // The schema form and the caller's output_config are asked rather than restated, so a
-        // caller asking the same question gets the answer this branch acts on.
+        // The branch is exactly the feasibility query, so a caller asking the same question gets
+        // the answer this branch acts on. Whether the model is one Anthropic documents as capable
+        // is not asked here: a caller that hands this connection a schema has already decided to
+        // send one, and re-checking would drop it from the request the caller asked to carry it.
         boolean nativeSchemaApplied = false;
-        if (canApplyNativeStructuredOutput(outputSchema, tools, rawModelParams)
-                && supportsNativeStructuredOutput(modelName)) {
+        if (canApplyNativeStructuredOutput(outputSchema, tools, rawModelParams)) {
             builder.outputConfig(toNativeOutputConfig((Class<?>) outputSchema));
             nativeSchemaApplied = true;
         }
@@ -594,8 +604,8 @@ public class AnthropicChatModelConnection extends BaseChatModelConnection {
         // The output_config test covers both ways one can reach the request: derived from
         // outputSchema above, or supplied by the caller through additional_kwargs. It keys on what
         // the request ends up carrying rather than on what was supplied, so a schema that could not
-        // be sent natively keeps the prefill its prompt-engineering fallback depends on — unless
-        // the caller supplied an output_config of its own.
+        // be sent natively keeps the prefill that a prompt-described schema depends on — unless the
+        // caller supplied an output_config of its own.
         Object jsonPrefill = modelParams.remove("json_prefill");
         boolean hasToolsInRequest = tools != null && !tools.isEmpty();
         boolean requestCarriesOutputConfig = nativeSchemaApplied || callerSuppliedOutputConfig;

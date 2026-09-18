@@ -135,6 +135,38 @@ class VLLMChatModelConnectionTest {
     }
 
     @Test
+    @DisplayName("A blank model is reported incapable and still gets the schema")
+    void testNativeResponseFormatAppliedWhenModelReportedIncapable() {
+        // SPEC row 8 for this connection. A blank effective model makes the inherited predicate
+        // report false, and before the capability conjunct was removed from the shared branch in
+        // OpenAICompletionsConnection that answer skipped the schema; now the request carries it.
+        //
+        // Driven against the connection directly because no shipped setup can reach this arm:
+        // VLLMChatModelSetup rejects a null or blank model in its constructor, and
+        // OpenAICompletionsSetup substitutes DEFAULT_MODEL for one. So this pins the connection
+        // contract rather than a user-visible configuration, and a blank model here is a stand-in
+        // for any model the predicate declines to classify.
+        //
+        // The blank goes on the descriptor rather than in the per-call parameters: the builder
+        // substitutes the configured default for a blank parameter, so leaving the descriptor
+        // without a model would resolve to null and fail in the SDK before reaching the branch
+        // this pins. withVLLMDefaults defaults api_key and api_base_url but never model.
+        VLLMChatModelConnection conn =
+                new VLLMChatModelConnection(
+                        connectionDescriptor().addInitialArgument("model", "   ").build(), NOOP);
+        java.util.Map<String, Object> modelParams = new HashMap<>();
+
+        assertThat(conn.supportsNativeStructuredOutput(conn.effectiveModelFor(modelParams)))
+                .isFalse();
+
+        ChatCompletionCreateParams params =
+                conn.buildRequest(
+                        List.of(ChatMessage.user("hi")), List.of(), modelParams, Person.class);
+
+        assertThat(params.responseFormat()).isPresent();
+    }
+
+    @Test
     @DisplayName("Defaults do not leak into the caller's descriptor")
     void testCallerDescriptorNotMutated() {
         ResourceDescriptor desc = connectionDescriptor().build();

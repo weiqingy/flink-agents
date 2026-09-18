@@ -386,9 +386,14 @@ class AnthropicChatModelConnectionTest {
     }
 
     @Test
-    @DisplayName("a POJO schema on an incapable model keeps the prompt fallback")
-    void testNativeSchemaNotAppliedOnIncapableModel() {
-        assertThat(build(INCAPABLE_MODEL, Answer.class, null).params.outputConfig()).isEmpty();
+    @DisplayName("a POJO schema on an incapable model is still sent as output_config")
+    void testNativeSchemaAppliedOnIncapableModel() {
+        // The connection no longer re-checks capability, so a caller that asked for a schema gets
+        // one on the wire and the provider answers for it, rather than having it dropped here.
+        // Asserting the property name rather than presence: a config built from the wrong class
+        // would be present too.
+        assertThat(nativeSchemaProperties(build(INCAPABLE_MODEL, Answer.class, null)))
+                .containsExactly("verdict");
     }
 
     @Test
@@ -413,19 +418,13 @@ class AnthropicChatModelConnectionTest {
     }
 
     @Test
-    @DisplayName("the model the request builder judges is the one the hook names")
-    void testEffectiveModelForNamesTheModelTheBuilderJudges() {
-        // The hook duplicates the builder's resolution rather than centralizing it, so only
-        // capturing what the builder feeds the predicate keeps the two from drifting apart.
-        AtomicReference<String> judged = new AtomicReference<>();
-        AnthropicChatModelConnection connection =
-                new AnthropicChatModelConnection(descriptor("claude-sonnet-4-20250514"), NOOP) {
-                    @Override
-                    protected boolean supportsNativeStructuredOutput(String effectiveModel) {
-                        judged.set(effectiveModel);
-                        return super.supportsNativeStructuredOutput(effectiveModel);
-                    }
-                };
+    @DisplayName("the model the hook names is the model the built request is issued against")
+    void testEffectiveModelForNamesTheModelTheRequestIssues() {
+        // The hook duplicates the builder's resolution rather than centralizing it, so the two can
+        // drift. The branch no longer consults the capability predicate, so the binding is taken
+        // against the model the request itself names: were they to diverge, the gate would judge
+        // one model while the call went to another.
+        AnthropicChatModelConnection connection = connection();
 
         for (Map<String, Object> modelParams :
                 List.<Map<String, Object>>of(
@@ -434,9 +433,10 @@ class AnthropicChatModelConnectionTest {
                         params(null))) {
             String named = connection.effectiveModelFor(modelParams);
 
-            connection.buildRequest(userMessage(), List.of(), modelParams, Answer.class);
+            AnthropicChatModelConnection.BuiltRequest built =
+                    connection.buildRequest(userMessage(), List.of(), modelParams, Answer.class);
 
-            assertThat(judged.get()).isEqualTo(named);
+            assertThat(built.params.model()).isEqualTo(Model.of(named));
         }
     }
 
@@ -614,10 +614,12 @@ class AnthropicChatModelConnectionTest {
     }
 
     @Test
-    @DisplayName("json_prefill survives when a schema falls back to prompt engineering")
-    void testJsonPrefillAppliedWhenSchemaFallsBack() {
-        // Suppression keys on whether the schema was applied, not on whether one was supplied.
-        // Keying it on the schema instead would strip the prefill the fallback still depends on.
+    @DisplayName("json_prefill is suppressed on an incapable model, which now carries a schema")
+    void testJsonPrefillSuppressedOnAnIncapableModel() {
+        // Suppression keys on what the request ends up carrying. A schema-carrying request on an
+        // incapable model used to carry no output_config and kept its prefill; now the schema is
+        // applied whatever the model, so the two can no longer share one request and the prefill
+        // goes. This is the second user-visible consequence of dropping the capability conjunct.
         AnthropicChatModelConnection connection = connection();
         AnthropicChatModelConnection.BuiltRequest built =
                 connection.buildRequest(
@@ -626,9 +628,10 @@ class AnthropicChatModelConnectionTest {
                         paramsWithModel(INCAPABLE_MODEL, true),
                         Answer.class);
 
-        assertThat(built.jsonPrefillApplied).isTrue();
-        assertThat(requestCarriesPrefill(built)).isTrue();
-        assertThat(connection.convertResponse(built, textResponse(CONTINUATION)).getContent())
+        assertThat(built.jsonPrefillApplied).isFalse();
+        assertThat(requestCarriesPrefill(built)).isFalse();
+        // Nothing was prepended, so the provider's document is returned exactly as it arrived.
+        assertThat(connection.convertResponse(built, textResponse(COMPLETED)).getContent())
                 .isEqualTo(COMPLETED);
     }
 
@@ -1160,8 +1163,8 @@ class AnthropicChatModelConnectionTest {
     @DisplayName("the feasibility query leaves the model's capability out of its answer")
     void testFeasibilityQueryExcludesModelCapability() {
         // Feasibility and capability are independent: a POJO is feasible here even on a model
-        // Anthropic does not document support for, and the branch's own capability conjunct is
-        // what keeps that request unconstrained.
+        // Anthropic does not document support for. The branch is now exactly this query, so that
+        // request carries the schema as well, and capability is the gate's business alone.
         Map<String, Object> incapable = paramsWithModel(INCAPABLE_MODEL, null);
 
         assertThat(connection().canApplyNativeStructuredOutput(Answer.class, List.of(), incapable))
@@ -1171,7 +1174,7 @@ class AnthropicChatModelConnectionTest {
                                 .buildRequest(userMessage(), List.of(), incapable, Answer.class)
                                 .params
                                 .outputConfig())
-                .isEmpty();
+                .isPresent();
     }
 
     @Test

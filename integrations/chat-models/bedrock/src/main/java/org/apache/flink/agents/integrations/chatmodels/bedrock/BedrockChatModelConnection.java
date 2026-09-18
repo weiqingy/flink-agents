@@ -211,8 +211,9 @@ public class BedrockChatModelConnection extends BaseChatModelConnection {
      * custom-model-deployment, application-inference-profile or marketplace-endpoint ARN identifies
      * a resource without naming the model behind it, and a prompt-router ARN names a set whose
      * member is chosen per request, so for none of them is an answer derivable from the identifier
-     * the request carries. An unrecognized identifier reports {@code false} so that it degrades to
-     * the prompt-engineering fallback rather than failing at the provider.
+     * the request carries. An unrecognized identifier reports {@code false}; what follows is the
+     * configured strategy's to decide, degrading to the prompt-engineering fallback under {@code
+     * AUTO} or {@code PROMPT} and sending the schema anyway under a forced {@code NATIVE}.
      *
      * <p>A null or blank model reports {@code false} rather than throwing: {@code resolveModel}
      * rejects one before a request is built, but this method is part of the connection contract and
@@ -258,7 +259,7 @@ public class BedrockChatModelConnection extends BaseChatModelConnection {
      * effective model's capability aside.
      *
      * <p>Only a POJO {@link Class} has a native translation here; a {@code RowTypeInfo} wrapped in
-     * {@code OutputSchema}, or any other form, has none and keeps the prompt-engineering fallback.
+     * {@code OutputSchema}, or any other form, has none, and the request carries no derived schema.
      * Nothing else about the request constrains the native branch, so neither the tools nor the
      * parameters are read: this connection sends a native schema alongside bound tools, and the one
      * parameter that would matter is the model, which is the capability question this excludes.
@@ -282,9 +283,14 @@ public class BedrockChatModelConnection extends BaseChatModelConnection {
 
     /**
      * Translates {@code outputSchema} into Converse's native {@code outputConfig} when it is a POJO
-     * {@link Class} and the effective model is one AWS documents as supporting it. Any other schema
-     * form — notably a {@code RowTypeInfo} wrapped in {@code OutputSchema} — and any other model
-     * leave the request unconstrained, so that the caller keeps the prompt-engineering fallback.
+     * {@link Class}. Any other schema form — notably a {@code RowTypeInfo} wrapped in {@code
+     * OutputSchema} — leaves the request unconstrained. What that means for the caller depends on
+     * its configured strategy: under {@code AUTO} or {@code PROMPT} the prompt-engineering fallback
+     * governs, while a forced {@code NATIVE} raises at the gate before a request is built.
+     *
+     * <p>Whether the effective model is one AWS documents as supporting a native schema is not
+     * asked here, so a schema supplied for a model this connection does not classify as capable
+     * reaches the provider and is answered there rather than dropped in silence.
      */
     @Override
     public ChatMessage chat(
@@ -311,7 +317,7 @@ public class BedrockChatModelConnection extends BaseChatModelConnection {
     /**
      * Translate the flink-agents call arguments into a Converse request: the effective model id,
      * the SYSTEM/conversation message split, the tool configuration, the inference configuration,
-     * and the native output configuration when the schema and the model both admit one.
+     * and the native output configuration when the schema admits one.
      *
      * <p>Package-private so a test can assert the request body without issuing a live call through
      * the Bedrock runtime client.
@@ -324,8 +330,8 @@ public class BedrockChatModelConnection extends BaseChatModelConnection {
      * @param modelParams per-call parameters; {@code model}, {@code temperature} and {@code
      *     max_tokens} are read, and {@code null} is accepted
      * @param outputSchema the schema the response should conform to, or {@code null} for an
-     *     unconstrained response; applied natively only for a POJO {@link Class} on a model that
-     *     supports it, and otherwise left to the caller's prompt-engineering fallback
+     *     unconstrained response; applied natively only for a POJO {@link Class}, and otherwise
+     *     left for the caller's configured strategy to answer for
      * @return the request to send to Converse
      * @throws IllegalArgumentException if neither the call nor the connection supplies a model id
      */
@@ -387,10 +393,11 @@ public class BedrockChatModelConnection extends BaseChatModelConnection {
             }
         }
 
-        // The feasibility half is asked rather than restated, so a caller asking the same question
-        // gets the answer this branch acts on.
-        if (canApplyNativeStructuredOutput(outputSchema, tools, modelParams)
-                && supportsNativeStructuredOutput(modelId)) {
+        // The branch is exactly the feasibility query, so a caller asking the same question gets
+        // the answer this branch acts on. Whether the effective model is one AWS documents support
+        // for is not asked here: a caller that hands this connection a schema has already decided
+        // to send one, and re-checking would drop it from the request the caller asked to carry it.
+        if (canApplyNativeStructuredOutput(outputSchema, tools, modelParams)) {
             requestBuilder.outputConfig(nativeOutputConfig((Class<?>) outputSchema));
         }
 

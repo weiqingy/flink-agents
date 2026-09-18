@@ -209,7 +209,7 @@ public class OllamaChatModelConnection extends BaseChatModelConnection {
      * model's capability aside.
      *
      * <p>Only a POJO {@link Class} has a native translation here; a {@code RowTypeInfo} wrapped in
-     * {@code OutputSchema}, or any other form, has none and keeps the prompt-engineering fallback.
+     * {@code OutputSchema}, or any other form, has none, and the request carries no derived schema.
      * Since this connection's capability predicate is unconditionally true, the schema form is the
      * whole of what it can report infeasible.
      *
@@ -236,8 +236,10 @@ public class OllamaChatModelConnection extends BaseChatModelConnection {
     /**
      * Translates {@code outputSchema} into Ollama's native {@code format} field when it is a POJO
      * {@link Class}. Any other schema form — notably a {@code RowTypeInfo} wrapped in {@code
-     * OutputSchema} — has no native translation here and leaves the request unconstrained, so that
-     * the prompt-engineering fallback still governs the response.
+     * OutputSchema} — has no native translation here and leaves the request unconstrained. What
+     * governs the response then depends on the caller's configured strategy: the prompt-engineering
+     * fallback under {@code AUTO} or {@code PROMPT}, and a raise at the gate under a forced {@code
+     * NATIVE}.
      */
     @Override
     public ChatMessage chat(
@@ -330,15 +332,17 @@ public class OllamaChatModelConnection extends BaseChatModelConnection {
         chatRequest.setTools(ollamaTools);
 
         // Native structured output applies only for a POJO Class schema; any other schema form,
-        // such as a RowTypeInfo wrapped in OutputSchema, keeps the prompt-engineering fallback.
+        // such as a RowTypeInfo wrapped in OutputSchema, carries no derived schema, and what that
+        // means for the caller is its strategy's to decide rather than this branch's.
         // The schema is a request field of its own rather than a sampling option, so it is set as
         // the request's format, which is left unset when no native translation applies and is then
         // omitted from the serialized body rather than serialized as null.
         //
-        // The feasibility half is asked rather than restated, so a caller asking the same question
-        // gets the answer this branch acts on.
-        if (canApplyNativeStructuredOutput(outputSchema, tools, modelParams)
-                && supportsNativeStructuredOutput(modelName)) {
+        // The branch is exactly the feasibility query, so a caller asking the same question gets
+        // the answer this branch acts on. This connection's own capability predicate is
+        // unconditionally true, so the conjunct that stood here decided nothing for it. A subclass
+        // that overrides that predicate to false would have been skipped before and is not now.
+        if (canApplyNativeStructuredOutput(outputSchema, tools, modelParams)) {
             chatRequest.setFormat(toNativeFormat((Class<?>) outputSchema));
         }
 

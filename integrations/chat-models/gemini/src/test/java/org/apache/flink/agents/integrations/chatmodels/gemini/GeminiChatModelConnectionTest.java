@@ -759,8 +759,10 @@ class GeminiChatModelConnectionTest {
     }
 
     @Test
-    @DisplayName("A model without documented support is never sent a schema")
-    void nativeSchemaSkippedForIncapableModel() {
+    @DisplayName("A model without documented support is still sent the schema")
+    void nativeSchemaAppliedForIncapableModel() {
+        // Capability no longer gates this branch, so a caller that asked for a schema gets one and
+        // the provider answers for it rather than having it dropped here.
         GenerateContentConfig config =
                 connection()
                         .buildConfig(
@@ -770,8 +772,8 @@ class GeminiChatModelConnectionTest {
                                 "gemini-2.5-flash-image",
                                 Report.class);
 
-        assertThat(config.responseJsonSchema()).isEmpty();
-        assertThat(config.responseMimeType()).isEmpty();
+        assertThat(config.responseJsonSchema()).isPresent();
+        assertThat(config.responseMimeType()).hasValue("application/json");
     }
 
     @Test
@@ -940,9 +942,6 @@ class GeminiChatModelConnectionTest {
         assertThat(connection().effectiveModelFor(modelParams)).isEqualTo("gemini-3-pro-preview");
     }
 
-    /** Stops the request after the config is assembled, so no call reaches the provider. */
-    private static final class StopBeforeRequest extends RuntimeException {}
-
     private static Map<String, Object> paramsWithModel(String model) {
         Map<String, Object> modelParams = params();
         modelParams.put("model", model);
@@ -950,44 +949,58 @@ class GeminiChatModelConnectionTest {
     }
 
     @Test
-    @DisplayName("The model the request builder judges is the one the hook names")
-    void effectiveModelForNamesTheModelTheBuilderJudges() {
-        // chat resolves the model and hands it to buildConfig, which is where the predicate is fed.
-        // Overriding buildConfig to stop once it has run binds the hook to the request without
-        // reaching the provider. Asserting each side against a literal would let the two drift in
-        // step, which is the one failure this has to catch.
-        AtomicReference<String> judged = new AtomicReference<>();
-        GeminiChatModelConnection connection =
-                new GeminiChatModelConnection(
-                        descriptor("test-key", null, "gemini-3-pro-preview"), NOOP) {
-                    @Override
-                    protected boolean supportsNativeStructuredOutput(String effectiveModel) {
-                        judged.set(effectiveModel);
-                        return super.supportsNativeStructuredOutput(effectiveModel);
-                    }
+    @DisplayName("The model the hook names is the model the wire request is issued against")
+    void effectiveModelForNamesTheModelOnTheWire() throws Exception {
+        // The buildConfig parameter is one step short of the wire: a change to what chat() hands
+        // generateContent would leave that parameter agreeing with the hook while the call went
+        // somewhere else. Driving chat() against a local stub and reading the model out of the
+        // request line closes that step without a live client.
+        com.sun.net.httpserver.HttpServer server =
+                com.sun.net.httpserver.HttpServer.create(
+                        new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        AtomicReference<String> requestPath = new AtomicReference<>();
+        server.createContext(
+                "/",
+                exchange -> {
+                    requestPath.set(exchange.getRequestURI().getPath());
+                    byte[] body = "{}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, body.length);
+                    exchange.getResponseBody().write(body);
+                    exchange.close();
+                });
+        server.start();
+        try {
+            String baseUrl = "http://127.0.0.1:" + server.getAddress().getPort();
+            GeminiChatModelConnection connection =
+                    new GeminiChatModelConnection(
+                            descriptor("test-key", baseUrl, "gemini-3-pro-preview"), NOOP);
 
-                    @Override
-                    GenerateContentConfig buildConfig(
-                            List<ChatMessage> messages,
-                            List<Tool> tools,
-                            Map<String, Object> arguments,
-                            String modelName,
-                            Object outputSchema) {
-                        super.buildConfig(messages, tools, arguments, modelName, outputSchema);
-                        throw new StopBeforeRequest();
-                    }
-                };
+            for (Map<String, Object> modelParams :
+                    List.<Map<String, Object>>of(
+                            paramsWithModel(CAPABLE_MODEL), paramsWithModel("   "), params())) {
+                requestPath.set(null);
+                String named = connection.effectiveModelFor(modelParams);
 
-        for (Map<String, Object> modelParams :
-                List.<Map<String, Object>>of(
-                        paramsWithModel(CAPABLE_MODEL), paramsWithModel("   "), params())) {
-            String named = connection.effectiveModelFor(modelParams);
+                // The stub cannot answer a real GenerateContentResponse, so the call may fail once
+                // the reply is parsed. What the server received is the assertion, and it has
+                // already been captured by then.
+                try {
+                    connection.chat(userMessage(), null, modelParams, Report.class);
+                } catch (RuntimeException expected) {
+                    // the reply is a stub; only the request matters here
+                }
 
-            assertThatThrownBy(
-                            () -> connection.chat(userMessage(), null, modelParams, Report.class))
-                    .hasRootCauseInstanceOf(StopBeforeRequest.class);
-
-            assertThat(judged.get()).isEqualTo(named);
+                assertThat(requestPath.get())
+                        .as("no request reached the stub for %s", modelParams)
+                        .isNotNull();
+                // Anchored on the path segment rather than a bare substring: appending a suffix
+                // such as -image both keeps the bare name present and is exactly the substitution
+                // this connection's capability predicate keys on, so a loose contains() would not
+                // see the one divergence that carries domain meaning.
+                assertThat(requestPath.get()).contains("/models/" + named + ":");
+            }
+        } finally {
+            server.stop(0);
         }
     }
 
@@ -1057,8 +1070,8 @@ class GeminiChatModelConnectionTest {
     @DisplayName("The feasibility query leaves the model's capability out of its answer")
     void feasibilityQueryExcludesModelCapability() {
         // Feasibility and capability are independent: a POJO with no tools bound is feasible here
-        // whatever the model is named, and the branch's own capability conjunct is what keeps an
-        // undocumented model's config unconstrained.
+        // whatever the model is named. The branch is now exactly this query, so an undocumented
+        // model's config carries the schema too, and capability is the gate's business alone.
         assertThat(connection().canApplyNativeStructuredOutput(Report.class, List.of(), params()))
                 .isTrue();
         assertThat(
@@ -1070,7 +1083,7 @@ class GeminiChatModelConnectionTest {
                                         "gemini-2.5-flash-image",
                                         Report.class)
                                 .responseJsonSchema())
-                .isEmpty();
+                .isPresent();
     }
 
     @Test

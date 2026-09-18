@@ -271,7 +271,7 @@ public class WatsonxChatModelConnection extends BaseChatModelConnection {
      * response_format}, the effective model's capability aside.
      *
      * <p>Only a POJO {@link Class} has a native translation here; a {@code RowTypeInfo} wrapped in
-     * {@code OutputSchema}, or any other form, has none and keeps the prompt-engineering fallback.
+     * {@code OutputSchema}, or any other form, has none, and the payload carries no derived schema.
      * Since this connection's capability predicate is unconditionally true, the schema form is the
      * whole of what it can report infeasible.
      *
@@ -305,8 +305,10 @@ public class WatsonxChatModelConnection extends BaseChatModelConnection {
     /**
      * Translates {@code outputSchema} into watsonx.ai's native {@code response_format} field when
      * it is a POJO {@link Class}. Any other schema form — notably a {@code RowTypeInfo} wrapped in
-     * {@code OutputSchema} — has no native translation here and leaves the request unconstrained,
-     * so that the prompt-engineering fallback still governs the response.
+     * {@code OutputSchema} — has no native translation here and leaves the request unconstrained.
+     * What governs the response then depends on the caller's configured strategy: the
+     * prompt-engineering fallback under {@code AUTO} or {@code PROMPT}, and a raise at the gate
+     * under a forced {@code NATIVE}.
      */
     @Override
     public ChatMessage chat(
@@ -507,15 +509,17 @@ public class WatsonxChatModelConnection extends BaseChatModelConnection {
                 (Map<String, Object>) modelParams.get("additional_kwargs");
 
         // Native structured output applies only for a POJO Class schema; any other schema form,
-        // such as a RowTypeInfo wrapped in OutputSchema, keeps the prompt-engineering fallback.
+        // such as a RowTypeInfo wrapped in OutputSchema, carries no derived schema, and what that
+        // means for the caller is its strategy's to decide rather than this branch's.
         // The derived schema is a request field of its own rather than a sampling option, so it is
         // written at the payload root. When no native translation applies the key stays absent
         // rather than being written as a null, which would still be a present field on the wire.
         //
-        // The feasibility half is asked rather than restated, so a caller asking the same question
-        // gets the answer this branch acts on.
-        if (canApplyNativeStructuredOutput(outputSchema, tools, modelParams)
-                && supportsNativeStructuredOutput(modelName)) {
+        // The branch is exactly the feasibility query, so a caller asking the same question gets
+        // the answer this branch acts on. This connection's own capability predicate is
+        // unconditionally true, so the conjunct that stood here decided nothing for it. A subclass
+        // that overrides that predicate to false would have been skipped before and is not now.
+        if (canApplyNativeStructuredOutput(outputSchema, tools, modelParams)) {
             // A caller reaches the same payload field through either channel. Only the branch that
             // actually sends a derived schema may reject the caller's value; every path that skips
             // it leaves that value untouched. A null is not a conflict, because both write loops

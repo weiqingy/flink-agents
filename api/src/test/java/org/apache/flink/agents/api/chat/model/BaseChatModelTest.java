@@ -776,6 +776,82 @@ class BaseChatModelTest {
     }
 
     @Test
+    @DisplayName("The gate resolves the parameters once, so both questions concern one request")
+    void testWillApplyNativeResolvesParametersOnceForBothQuestions() {
+        List<Map<String, Object>> feasibilityMaps = new ArrayList<>();
+        List<Map<String, Object>> capabilityMaps = new ArrayList<>();
+        RecordingConnection connection =
+                new RecordingConnection() {
+                    @Override
+                    protected boolean canApplyNativeStructuredOutput(
+                            @Nullable Object outputSchema,
+                            @Nullable List<Tool> tools,
+                            @Nullable Map<String, Object> modelParams) {
+                        feasibilityMaps.add(modelParams);
+                        return true;
+                    }
+
+                    @Override
+                    protected String effectiveModelFor(@Nullable Map<String, Object> modelParams) {
+                        capabilityMaps.add(modelParams);
+                        return "backing-model";
+                    }
+
+                    @Override
+                    protected boolean supportsNativeStructuredOutput(String effectiveModel) {
+                        return true;
+                    }
+                };
+        int[] resolutions = new int[1];
+        RecordingChatModelSetup setup =
+                new RecordingChatModelSetup(connection, null) {
+                    @Override
+                    public Map<String, Object> getParameters() {
+                        resolutions[0]++;
+                        return super.getParameters();
+                    }
+                };
+        setup.parameters.put("model", "gpt-4o");
+
+        assertTrue(setup.willApplyNativeStructuredOutput(String.class));
+
+        // getParameters() hands back a fresh map on every call, so resolving it a second time
+        // would put the two questions to two different maps. The identity assertion is what makes
+        // "one request" checkable: equal contents would still pass if each question got its own.
+        assertEquals(1, resolutions[0]);
+        assertEquals(1, feasibilityMaps.size());
+        assertEquals(1, capabilityMaps.size());
+        assertSame(feasibilityMaps.get(0), capabilityMaps.get(0));
+    }
+
+    @Test
+    @DisplayName("The connection precondition is checked before the schema is inspected")
+    void testConnectionPreconditionPrecedesTheSchemaCheck() {
+        // No strategy is named: the connection is null, so both members raise before the strategy
+        // is read, and passing one here would suggest it bore on the outcome.
+        RecordingChatModelSetup setup = new RecordingChatModelSetup(null, null);
+
+        // Both members test the connection first. Reversed, chatStructured() would report a
+        // missing schema and the gate would answer false for a null one, and each would be
+        // describing the call rather than the setup that is in no state to make it.
+        NullPointerException structured =
+                assertThrows(
+                        NullPointerException.class,
+                        () ->
+                                setup.chatStructured(
+                                        List.of(new ChatMessage(MessageRole.USER, "hi")),
+                                        Map.of(),
+                                        null));
+        assertTrue(structured.getMessage().contains("Connection is not initialized"));
+
+        NullPointerException gate =
+                assertThrows(
+                        NullPointerException.class,
+                        () -> setup.willApplyNativeStructuredOutput(null));
+        assertTrue(gate.getMessage().contains("Connection is not initialized"));
+    }
+
+    @Test
     @DisplayName("Structured-output strategy defaults to AUTO when the descriptor omits it")
     void testStructuredOutputStrategyDefaultsToAuto() {
         RecordingChatModelSetup setup =
