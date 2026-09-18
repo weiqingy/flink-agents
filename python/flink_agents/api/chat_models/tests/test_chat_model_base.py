@@ -297,8 +297,10 @@ def test_effective_model_for_reads_the_model_param() -> None:
 def test_effective_model_for_returns_none_when_no_model_param() -> None:
     """A connection carrying no default of its own has no model to resolve.
 
-    The capability predicate reports a ``None`` model not capable rather than raising,
-    so answering ``None`` degrades to the prompt-engineering fallback.
+    The capability predicate reports a ``None`` model not capable rather than raising.
+    What follows is the configured strategy's to decide: the prompt-engineering
+    fallback under ``AUTO`` or ``PROMPT``, and the schema sent anyway under a forced
+    ``NATIVE``.
     """
     connection = _RecordingConnection()
 
@@ -735,3 +737,66 @@ def test_chat_structured_requires_a_resolved_connection() -> None:
         setup.chat_structured(
             [ChatMessage(role=MessageRole.USER, content="hi")], _pojo_schema()
         )
+
+
+def test_connection_precondition_precedes_the_schema_check() -> None:
+    """Both members test the connection before they look at the schema.
+
+    The two tests above pass a valid schema, so neither can tell which check ran
+    first. Passing ``None`` separates them: reversed, ``chat_structured`` would report
+    a missing schema and the gate would answer ``False`` for a ``None`` one, and each
+    would be describing the call rather than the setup that is in no state to make it.
+    """
+    setup = _GateChatModelSetup(connection="c", model="m")
+
+    with pytest.raises(TypeError, match="has not been resolved"):
+        setup.will_apply_native_structured_output(None)
+
+    with pytest.raises(TypeError, match="has not been resolved"):
+        setup.chat_structured([ChatMessage(role=MessageRole.USER, content="hi")], None)
+
+
+def test_will_apply_native_resolves_the_parameters_once_for_both_questions() -> None:
+    """Both questions are put to one mapping, so they concern a single request.
+
+    ``model_kwargs`` hands back a fresh mapping on every read, so resolving it twice
+    would put the two questions to two different mappings. Identity is what makes
+    "one request" checkable: comparing contents would still pass if each question got
+    its own copy.
+    """
+    seen: List[Mapping[str, Any] | None] = []
+    resolutions: List[int] = []
+
+    class _IdentityConnection(_GateConnection):
+        def can_apply_native_structured_output(
+            self,
+            output_schema: OutputSchema | None,
+            tools: List[Tool] | None,
+            model_kwargs: Mapping[str, Any] | None,
+        ) -> bool:
+            seen.append(model_kwargs)
+            return super().can_apply_native_structured_output(
+                output_schema, tools, model_kwargs
+            )
+
+        def effective_model_for(
+            self, model_kwargs: Mapping[str, Any] | None
+        ) -> str | None:
+            seen.append(model_kwargs)
+            return super().effective_model_for(model_kwargs)
+
+    class _CountingGateSetup(_GateChatModelSetup):
+        @property
+        def model_kwargs(self) -> Dict[str, Any]:
+            resolutions.append(1)
+            return super().model_kwargs
+
+    setup = _CountingGateSetup(connection="c", model="m")
+    setup.parameters["model"] = "gpt-4o"
+    setup._resolved_connection = _IdentityConnection(feasible=True, capable=True)
+
+    assert setup.will_apply_native_structured_output(_pojo_schema()) is True
+
+    assert resolutions == [1]
+    assert len(seen) == 2
+    assert seen[0] is seen[1]

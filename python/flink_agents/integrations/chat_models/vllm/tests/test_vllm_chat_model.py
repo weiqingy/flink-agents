@@ -92,18 +92,25 @@ def test_supports_native_structured_output_follows_served_model() -> None:
     assert not connection.supports_native_structured_output(" ")
 
 
-def test_native_response_format_applied_for_qwen_model() -> None:
+def _mocked_connection() -> tuple[VLLMChatModelConnection, MagicMock]:
+    """A connection whose OpenAI client is a mock, returned alongside it."""
     connection = VLLMChatModelConnection()
     mock_client = MagicMock()
     mock_message = MagicMock()
     mock_message.role = "assistant"
     mock_message.content = "ok"
     mock_message.tool_calls = None
+    mock_message.refusal = None
     mock_client.chat.completions.create.return_value.choices = [
         MagicMock(message=mock_message)
     ]
     mock_client.chat.completions.create.return_value.usage = None
     connection._client = mock_client
+    return connection, mock_client
+
+
+def test_native_response_format_applied_for_qwen_model() -> None:
+    connection, mock_client = _mocked_connection()
 
     connection.chat(
         [ChatMessage(role=MessageRole.USER, content="hi")],
@@ -114,6 +121,37 @@ def test_native_response_format_applied_for_qwen_model() -> None:
     kwargs = mock_client.chat.completions.create.call_args.kwargs
     assert "response_format" in kwargs
     assert kwargs["response_format"]["type"] == "json_schema"
+
+
+def test_native_response_format_applied_when_model_reported_incapable() -> None:
+    """A blank served model is reported incapable and still gets the schema.
+
+    A blank effective model makes the inherited predicate report ``False``. Before the
+    capability conjunct was removed from the shared branch in
+    ``OpenAIChatModelConnection`` that answer skipped the schema; now the request
+    carries it and the server is what answers for it.
+
+    Driven against the connection directly because ``VLLMChatModelSetup`` rejects a
+    blank model in its constructor, so no vLLM setup can produce this call. The arm is
+    reachable all the same: ``OpenAIChatModelSetup`` defaults only an *omitted* model,
+    so ``OpenAIChatModelSetup(model="   ")`` keeps the blank and reaches this same
+    inherited branch. A blank model here stands in for any name the predicate declines
+    to classify.
+    """
+    connection, mock_client = _mocked_connection()
+
+    assert not connection.supports_native_structured_output(
+        connection.effective_model_for({"model": "   "})
+    )
+
+    connection.chat(
+        [ChatMessage(role=MessageRole.USER, content="hi")],
+        model="   ",
+        output_schema=OutputSchema(output_schema=_Person),
+    )
+
+    kwargs = mock_client.chat.completions.create.call_args.kwargs
+    assert kwargs["response_format"]["json_schema"]["name"] == "_Person"
 
 
 def test_setup_carries_served_model_name() -> None:

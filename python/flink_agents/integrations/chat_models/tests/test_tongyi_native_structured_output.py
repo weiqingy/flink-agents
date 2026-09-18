@@ -147,18 +147,18 @@ def test_native_response_format_applied_on_capable_model(monkeypatch) -> None:
     assert kwargs["result_format"] == "message"
 
 
-def test_native_not_applied_for_default_model(monkeypatch) -> None:
-    """The default model answers a schema instead of refusing it, and sends none.
+def test_native_applied_for_default_model(monkeypatch) -> None:
+    """The default model is outside the allowlist and is still sent the schema.
 
-    Omitting ``model`` is the path every existing caller is on, so the schema is
-    answered with the prompt-engineering fallback rather than raising, and no
-    undocumented parameter reaches the request.
+    Omitting ``model`` resolves to ``qwen-plus``, which the allowlist rejects. The
+    branch no longer consults that answer, so the schema reaches the provider and the
+    provider decides on it, rather than being dropped here.
     """
     response, kwargs = _chat(
         monkeypatch, output_schema=OutputSchema(output_schema=Person)
     )
     assert response.content == "ok"
-    assert "response_format" not in kwargs
+    assert kwargs["response_format"]["json_schema"]["name"] == "Person"
 
 
 def test_native_not_applied_when_schema_none(monkeypatch) -> None:
@@ -172,10 +172,12 @@ def test_native_not_applied_when_schema_none(monkeypatch) -> None:
 
 
 def test_native_not_applied_for_row_type_info(monkeypatch) -> None:
-    """A RowTypeInfo schema falls back to prompting rather than raising.
+    """A RowTypeInfo schema leaves the request unchanged rather than raising here.
 
-    There is no native translation for it, so the request is left unchanged and
-    no RowTypeInfo reaches the request body.
+    There is no native translation for it, so no RowTypeInfo reaches the request
+    body. What governs the response then is the caller's configured strategy: the
+    prompt-engineering fallback under ``AUTO`` or ``PROMPT``, and under a forced
+    ``NATIVE`` a raise at the gate before this call is built.
     """
     row_type = Types.ROW_NAMED(["name"], [Types.STRING()])
     response, kwargs = _chat(
@@ -271,24 +273,6 @@ def test_row_type_info_leaves_a_caller_response_format_alone(monkeypatch) -> Non
 _DEFAULT_MODEL = "qwen-plus"
 
 
-def _judging_connection() -> tuple[TongyiChatModelConnection, list[str | None]]:
-    """A connection recording every model its request path judges for capability.
-
-    Subclassing keeps the predicate itself under test rather than standing a stub in
-    for it: the override notes what it was asked about and delegates to the real one.
-    """
-    judged: list[str | None] = []
-
-    class _JudgingConnection(TongyiChatModelConnection):
-        def supports_native_structured_output(
-            self, effective_model: str | None
-        ) -> bool:
-            judged.append(effective_model)
-            return super().supports_native_structured_output(effective_model)
-
-    return _JudgingConnection(api_key="fake-key"), judged
-
-
 def test_effective_model_for_applies_the_default_model() -> None:
     """A call naming no model resolves to the model the request would be issued to.
 
@@ -331,18 +315,19 @@ def test_effective_model_for_does_not_consume_the_model() -> None:
     [{"model": _CAPABLE_MODEL}, {"model": "qwen-turbo"}, {"model": ""}, {}],
     ids=["capable", "incapable", "blank", "absent"],
 )
-def test_effective_model_for_names_the_model_the_request_judges(
+def test_effective_model_for_names_the_model_the_request_issues(
     monkeypatch, model_kwargs: dict[str, Any]
 ) -> None:
-    """The hook names exactly the model the request path asks the predicate about.
+    """The hook names exactly the model the request is issued against.
 
-    The hook duplicates the builder's resolution rather than centralizing it, so only
-    capturing what the request feeds the predicate keeps the two from drifting apart.
-    A fresh connection per case is what makes the single-element comparison also an
-    assertion that the predicate was reached at all.
+    The hook duplicates the builder's resolution rather than centralizing it, so the
+    two can drift. The branch no longer consults the capability predicate, so the
+    binding is taken against the model the provider call names: were they to diverge,
+    the gate would judge one model while the call went to another. Both apply the same
+    default for an absent parameter, which is the case that would drift first.
     """
-    conn, judged = _judging_connection()
-    _patched_call(monkeypatch)
+    conn = _connection()
+    mock_call = _patched_call(monkeypatch)
 
     named = conn.effective_model_for(model_kwargs)
     conn.chat(
@@ -351,7 +336,7 @@ def test_effective_model_for_names_the_model_the_request_judges(
         **model_kwargs,
     )
 
-    assert judged == [named]
+    assert mock_call.call_args.kwargs["model"] == named
 
 
 def _add(a: int, b: int) -> int:
@@ -429,10 +414,10 @@ def test_feasibility_query_agrees_with_the_native_branch(monkeypatch) -> None:
 def test_feasibility_query_excludes_model_capability(monkeypatch) -> None:
     """A translatable schema stays feasible on a model the allowlist rejects.
 
-    The two answers are independent, and it is the branch's separate capability
-    conjunct that leaves such a request unconstrained. A capability conjunct folded
-    into the query would be invisible to the binding test above, which moves both sides
-    at once, so it is pinned here.
+    The two answers are independent. The branch is now exactly this query, so such a
+    request carries the schema as well, and capability is the gate's business alone. A
+    capability conjunct folded into the query would be invisible to the binding test
+    above, which moves both sides at once, so it is pinned here.
     """
     conn = _connection()
     incapable = {"model": "qwen-turbo"}
@@ -448,7 +433,9 @@ def test_feasibility_query_excludes_model_capability(monkeypatch) -> None:
     conn.chat(
         _messages(), output_schema=OutputSchema(output_schema=Person), **incapable
     )
-    assert "response_format" not in mock_call.call_args.kwargs
+    assert mock_call.call_args.kwargs["response_format"]["json_schema"]["name"] == (
+        "Person"
+    )
 
 
 def test_feasibility_query_ignores_a_caller_response_format() -> None:

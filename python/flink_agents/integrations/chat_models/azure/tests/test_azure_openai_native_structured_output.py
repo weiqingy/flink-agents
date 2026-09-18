@@ -184,19 +184,30 @@ def test_capable_native_request_still_targets_the_deployment() -> None:
     assert _create_call_kwargs(conn)["model"] == DEPLOYMENT
 
 
-def test_native_not_applied_when_deployment_model_absent() -> None:
-    """Native NOT applied when the backing model of the deployment is unknown."""
+def test_native_applied_when_deployment_model_absent() -> None:
+    """Native applied even when the backing model of the deployment is absent.
+
+    An absent backing model means the connection can say nothing about capability. It
+    no longer withholds the schema for that reason: feasibility here is the schema form
+    and the api-version floor, both of which hold.
+    """
     conn = _connection()
     conn.chat(
         [ChatMessage(role=MessageRole.USER, content="hi")],
         model=DEPLOYMENT,
         output_schema=OutputSchema(output_schema=Person),
     )
-    assert "response_format" not in _create_call_kwargs(conn)
+    assert _create_call_kwargs(conn)["response_format"]["json_schema"]["name"] == (
+        "Person"
+    )
 
 
-def test_native_not_applied_for_unknown_deployment_model() -> None:
-    """Native NOT applied for a backing model outside the allowlist."""
+def test_native_applied_for_unknown_deployment_model() -> None:
+    """A backing model the allowlist does not carry is still sent the schema.
+
+    An unrecognized name is not a reason to withhold the schema any more; the provider
+    rejects it if it cannot honor it.
+    """
     conn = _connection()
     conn.chat(
         [ChatMessage(role=MessageRole.USER, content="hi")],
@@ -204,14 +215,16 @@ def test_native_not_applied_for_unknown_deployment_model() -> None:
         model_of_azure_deployment="some-unknown-model",
         output_schema=OutputSchema(output_schema=Person),
     )
-    assert "response_format" not in _create_call_kwargs(conn)
+    assert "response_format" in _create_call_kwargs(conn)
 
 
-def test_native_not_applied_for_bare_gpt_4o() -> None:
-    """Native NOT applied for a bare `gpt-4o` backing model.
+def test_native_applied_for_bare_gpt_4o() -> None:
+    """A bare `gpt-4o` backing model is still sent the schema.
 
     Azure carries model name and model version as separate properties, so a bare
     `gpt-4o` may be the 2024-05-13 version, which predates structured output support.
+    That ambiguity is the provider's to resolve now rather than a reason to drop the
+    schema here.
     """
     conn = _connection()
     conn.chat(
@@ -220,7 +233,7 @@ def test_native_not_applied_for_bare_gpt_4o() -> None:
         model_of_azure_deployment="gpt-4o",
         output_schema=OutputSchema(output_schema=Person),
     )
-    assert "response_format" not in _create_call_kwargs(conn)
+    assert "response_format" in _create_call_kwargs(conn)
 
 
 @pytest.mark.parametrize("api_version", ["2024-08-01", "2024-10-21"])
@@ -372,13 +385,11 @@ def test_caller_response_format_conflict_precedes_the_schema_render() -> None:
 @pytest.mark.parametrize(
     ("api_version", "model_of_azure_deployment", "schema"),
     [
-        (CAPABLE_API_VERSION, "gpt-4o", Person),
         (CAPABLE_API_VERSION, "gpt-4o-mini", ROW_TYPE),
         (CAPABLE_API_VERSION, "gpt-4o-mini", None),
         (BELOW_FLOOR_API_VERSION, "gpt-4o-mini", Person),
     ],
     ids=[
-        "incapable_model",
         "row_type_info_schema",
         "no_output_schema",
         "api_version_below_floor",
@@ -392,12 +403,14 @@ def test_caller_response_format_survives_when_native_is_skipped(
 ) -> None:
     """The same caller input passes through untouched wherever native output is skipped.
 
-    Native output is skipped for an incapable backing model, for a schema kind outside
-    the natively translatable set, for no schema at all, and for an api-version below
-    the floor. Only the branch that actually sends a schema as response_format may
-    reject the caller's own value, so identical caller code has to keep working along
-    every one of those paths, including the no-schema path taken by any caller that
-    drives response_format itself.
+    Native output is skipped for a schema kind outside the natively translatable set,
+    for no schema at all, and for an api-version below the floor. Only the branch that
+    actually sends a schema as response_format may reject the caller's own value, so
+    identical caller code has to keep working along every one of those paths, including
+    the no-schema path taken by any caller that drives response_format itself.
+
+    The incapable-backing-model case is deliberately absent: that path now applies the
+    schema and so rejects the caller's value, which the conflict test below pins.
     """
     conn = _connection(api_version=api_version)
     _chat_with_caller_response_format(
@@ -527,39 +540,6 @@ def _model_kwargs(backing_model: str | None = None) -> dict[str, Any]:
     return params
 
 
-def _judging_connection() -> tuple[AzureOpenAIChatModelConnection, list[str | None]]:
-    """A connection recording every model its request path judges for capability.
-
-    Subclassing keeps the predicate itself under test rather than standing a stub in
-    for it: the override notes what it was asked about and delegates to the real one.
-    """
-    judged: list[str | None] = []
-
-    class _JudgingConnection(AzureOpenAIChatModelConnection):
-        def supports_native_structured_output(
-            self, effective_model: str | None
-        ) -> bool:
-            judged.append(effective_model)
-            return super().supports_native_structured_output(effective_model)
-
-    conn = _JudgingConnection(
-        api_key="test-key",
-        azure_endpoint="https://example.openai.azure.com",
-        api_version=CAPABLE_API_VERSION,
-    )
-    mock_client = MagicMock()
-    mock_message = MagicMock()
-    mock_message.role = "assistant"
-    mock_message.content = "ok"
-    mock_message.tool_calls = None
-    mock_client.chat.completions.create.return_value.choices = [
-        MagicMock(message=mock_message)
-    ]
-    mock_client.chat.completions.create.return_value.usage = None
-    conn._client = mock_client
-    return conn, judged
-
-
 def test_effective_model_for_returns_backing_model() -> None:
     """Capability is asked about the model behind the deployment, not the deployment."""
     assert (
@@ -595,29 +575,29 @@ def test_effective_model_for_does_not_consume_the_backing_model() -> None:
     ["gpt-4o-mini", "some-unknown-model", None],
     ids=["capable", "unknown", "unset"],
 )
-def test_effective_model_for_names_the_model_the_request_judges(
+def test_effective_model_for_names_the_backing_model_not_the_deployment(
     backing_model: str | None,
 ) -> None:
-    """The hook names exactly the model the request path asks the predicate about.
+    """The hook names the backing model while the request names the deployment.
 
-    The hook duplicates the builder's resolution rather than centralizing it, so only
-    capturing what the request feeds the predicate keeps the two from drifting apart;
-    comparing each against a literal would let them drift in step. A fresh connection
-    per case is what makes the single-element comparison also an assertion that the
-    predicate was reached at all.
+    Azure is the one connection where the hook and the request are meant to disagree.
+    The call goes to a deployment the user named; capability belongs to the model
+    behind it, and a deployment name carries no model information. The sibling
+    connections bind the two together, so this pins the divergence instead, and fails
+    if anyone "fixes" it by feeding the deployment to the hook or the backing model to
+    the request.
     """
-    conn, judged = _judging_connection()
+    conn = _connection()
     model_kwargs = _model_kwargs(backing_model)
 
-    named = conn.effective_model_for(model_kwargs)
     conn.chat(
         [ChatMessage(role=MessageRole.USER, content="hi")],
         output_schema=OutputSchema(output_schema=Person),
         **model_kwargs,
     )
 
-    assert judged == [named]
-    assert judged[0] != DEPLOYMENT
+    assert conn.effective_model_for(model_kwargs) == backing_model
+    assert _create_call_kwargs(conn)["model"] == DEPLOYMENT
 
 
 def _query_recording_connection(
@@ -724,10 +704,10 @@ def test_feasibility_query_follows_the_api_version_floor() -> None:
 def test_feasibility_query_excludes_model_capability() -> None:
     """A translatable schema stays feasible on a backing model the allowlist rejects.
 
-    The two answers are independent, and it is the branch's separate capability
-    conjunct that leaves such a request unconstrained. A capability conjunct folded
-    into the query would be invisible to the binding test above, which moves both sides
-    at once, so it is pinned here.
+    The two answers are independent. The branch is now exactly this query, so such a
+    request carries the schema as well, and capability is the gate's business alone. A
+    capability conjunct folded into the query would be invisible to the binding test
+    above, which moves both sides at once, so it is pinned here.
     """
     conn = _connection()
     incapable = _model_kwargs("gpt-3.5-turbo")
@@ -744,7 +724,26 @@ def test_feasibility_query_excludes_model_capability() -> None:
         output_schema=OutputSchema(output_schema=Person),
         **incapable,
     )
-    assert "response_format" not in _create_call_kwargs(conn)
+    assert "response_format" in _create_call_kwargs(conn)
+
+
+def test_caller_response_format_conflicts_on_an_incapable_backing_model() -> None:
+    """A caller response_format now conflicts even on a backing model outside the list.
+
+    The conflict check fires whenever the branch applied a schema. The branch no longer
+    tests capability, so a request that used to pass the caller's value through
+    untouched is now refused outright. This is a user-visible consequence of removing
+    that conjunct, and it is why the incapable-model case left the skipped-path source
+    above.
+    """
+    conn = _connection()
+
+    with pytest.raises(ValueError, match="response_format must not also be"):
+        _chat_with_caller_response_format(
+            conn,
+            model_of_azure_deployment="gpt-4o",
+            in_additional_kwargs=False,
+        )
 
 
 @pytest.mark.parametrize("in_additional_kwargs", [True, False])

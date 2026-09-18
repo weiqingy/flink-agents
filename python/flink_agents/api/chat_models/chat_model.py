@@ -142,12 +142,15 @@ class BaseChatModelConnection(Resource, ABC):
         provider the request targets a deployment name the user chose while capability
         belongs to the model backing it, so the two disagree in both directions.
 
-        The default ``False`` keeps a connection on the prompt-engineering fallback. A
-        connection that classifies by model name must report ``False`` for a name it
-        does not recognize, so that it degrades to the fallback rather than failing at
-        the provider. A connection whose capability belongs to the endpoint rather than
-        to the model answers for the endpoint instead, and may report ``True`` for a
-        name it has never seen.
+        The default ``False`` keeps a connection on the prompt-engineering fallback
+        wherever the configured strategy defers to capability. A connection that
+        classifies by model name must still report ``False`` for a name it does not
+        recognize. What that buys depends on the configured strategy rather
+        than on this connection: under ``AUTO`` or ``PROMPT`` it degrades to the
+        fallback rather than failing at the provider, while under a forced ``NATIVE``
+        the schema is sent anyway and the provider answers for it. A connection whose
+        capability belongs to the endpoint rather than to the model answers for the
+        endpoint instead, and may report ``True`` for a name it has never seen.
 
         This answer is advisory rather than binding: it is a statement about the model
         that a configured policy is permitted to overrule, and
@@ -233,18 +236,21 @@ class BaseChatModelConnection(Resource, ABC):
         carrying.
 
         A ``False`` answer is not an error: it reports that the request would carry no
-        native schema, so the caller keeps the prompt-engineering fallback rather than
-        losing the schema. A ``True`` is not a promise that the call succeeds either: a
+        native schema. What the caller does with that is the configured strategy's to
+        decide. Under ``AUTO`` or ``PROMPT`` it keeps the prompt-engineering fallback
+        rather than losing the schema, while under a forced ``NATIVE`` the gate raises
+        rather than falling back, since no request it builds could express the schema.
+        A ``True`` is not a promise that the call succeeds either: a
         connection may still raise once its native branch has decided to apply the
         schema, as happens where the caller supplied a response format of its own that
         conflicts with it.
 
         The default ``False`` is safe only for a connection that translates no schema at
         all. A connection whose request path has a native branch but which leaves this
-        unoverridden reports every request infeasible: a caller that degrades to the
-        prompt-engineering fallback then silently never reaches that branch, and one
-        that refuses an unapplicable schema instead fails on a request the connection
-        could in fact have applied.
+        unoverridden reports every request infeasible: a caller that falls back to the
+        prompt then silently never reaches that branch, and one that refuses an
+        unapplicable schema instead fails on a request the connection could in fact
+        have applied.
 
         Answers about the request rather than validating it. A ``None``
         ``output_schema`` is an unconstrained request, a ``None`` ``tools`` is a request
@@ -294,8 +300,8 @@ class BaseChatModelConnection(Resource, ABC):
         msg = (
             f"{cls.__module__}.{cls.__qualname__} has no native structured-output"
             " translation, so it cannot honor the given output schema. Override chat()"
-            " to translate the schema natively, or pass no schema so the caller applies"
-            " the prompt-engineering fallback."
+            " to translate the schema natively, or pass no schema so the caller"
+            " describes it in the prompt instead."
         )
         raise NotImplementedError(msg)
 
@@ -376,7 +382,9 @@ class BaseChatModelConnection(Resource, ABC):
             ``RowTypeInfo``. No implementation translates a ``RowTypeInfo`` natively,
             and what follows differs by implementation: one that translates a
             ``BaseModel`` natively skips the ``RowTypeInfo`` and leaves the request
-            unchanged, so the caller keeps the prompt-engineering fallback; one with
+            unchanged, and whether the caller then keeps the prompt-engineering
+            fallback or is refused depends on its configured strategy, since a forced
+            ``NATIVE`` raises at the gate on a schema no request can express; one with
             no native translation at all rejects it, as described below. The skip is a
             deliberate, permanent fallback, not a translation still to be written.
 
@@ -387,9 +395,11 @@ class BaseChatModelConnection(Resource, ABC):
             member renders under Pydantic, and one provider's renderer takes it while
             another refuses it. Neither is raised unless the request was going to
             carry a native schema, since an implementation renders only once it has
-            decided to send one — so an unrenderable schema reports nothing when the
-            effective model is not one the implementation calls natively capable, or
-            when some other condition has already ruled the native branch out.
+            decided to send one, so an unrenderable schema reports nothing when a
+            condition has ruled the native branch out. The effective model's capability
+            is not such a condition: an implementation's native branch tests only
+            whether it could encode the schema, so one it cannot render raises even for
+            a model it does not classify as capable.
 
             A ``BaseModel`` subclass that renders but declares no fields is sent as
             rendered, leaving the receiving provider to accept or refuse it.
@@ -584,9 +594,9 @@ class BaseChatModelSetup(Resource):
     def will_apply_native_structured_output(
         self, output_schema: OutputSchema | None
     ) -> bool:
-        """Whether ``output_schema`` should travel through the provider's native
-        structured output on a call issued through ``chat_structured``, rather than be
-        described to the model in the prompt.
+        """Whether a call issued through ``chat_structured`` would carry
+        ``output_schema`` to the provider as a native schema, rather than leave it to
+        be described to the model in the prompt.
 
         Framework-facing rather than a user entry point: a user configures the outcome
         through the structured-output strategy the descriptor carries instead of
@@ -602,12 +612,22 @@ class BaseChatModelSetup(Resource):
         ``effective_model_for`` from being consulted about such a form at all, which
         matters because neither contract forbids an override from raising.
 
+        A ``True`` says what such a call carries, not merely which of the two channels
+        was chosen for it. A connection's native branch is exactly the feasibility
+        query composed here, asked about the same tool-free request and the same
+        ``model_kwargs`` mapping, so a request that query reports feasible is one whose
+        native schema parameter the connection writes. Per-call parameters are the
+        limit of that: ``chat_structured`` merges them over ``model_kwargs``, so a
+        caller that adds one its connection reads for feasibility can be answered here
+        about a different request from the one it goes on to build.
+
         A ``True`` is not a promise that ``chat_structured`` returns a response: a
         connection may still raise once its native branch has decided to apply the
         schema, as happens where the caller supplied a response format of its own that
         conflicts with it, or where the schema renders to no document the provider
         will take. Such a failure is that connection's documented answer and reaches
-        the caller as it was raised.
+        the caller as it was raised. Nor is it a promise about the reply: what a
+        provider does with a schema it was sent is the provider's own business.
 
         Answers about a call rather than issuing one: this method sends no request.
         What the connection's hooks do when consulted is their own contracts'
@@ -712,7 +732,10 @@ class BaseChatModelSetup(Resource):
             The schema the call carries, which must not be ``None``.
         **kwargs : Any
             Parameters for this call alone, merged over ``model_kwargs`` the same way
-            ``chat`` merges them.
+            ``chat`` merges them. ``will_apply_native_structured_output`` is answered
+            about ``model_kwargs`` alone, so a parameter supplied here that its
+            connection reads when judging feasibility makes this call differ from the
+            one that gate answered about.
 
         Returns:
         -------

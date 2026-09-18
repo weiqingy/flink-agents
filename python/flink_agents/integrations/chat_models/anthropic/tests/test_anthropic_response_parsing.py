@@ -348,10 +348,16 @@ def test_map_member_schema_is_accepted_and_sent_whole() -> None:
     assert output_config["format"]["schema"]["properties"]["labels"]["properties"] == {}
 
 
-def test_native_output_config_not_applied_on_incapable_model() -> None:
-    assert "output_config" not in _request_kwargs(
+def test_native_output_config_applied_on_incapable_model() -> None:
+    # The connection no longer re-checks capability, so a caller that asked for a
+    # schema gets one on the wire and the provider answers for it, rather than having
+    # it dropped here. Asserting the rendered document rather than mere presence: a
+    # config built from the wrong class would be present too.
+    output_config = _request_kwargs(
         model=_INCAPABLE_MODEL, output_schema=OutputSchema(output_schema=_Answer)
-    )
+    )["output_config"]
+
+    assert output_config["format"]["schema"] == transform_schema(_Answer)
 
 
 def test_native_output_config_not_applied_without_schema() -> None:
@@ -361,8 +367,8 @@ def test_native_output_config_not_applied_without_schema() -> None:
 
 
 def test_native_output_config_not_applied_for_row_type_info() -> None:
-    # A RowTypeInfo schema has no native translation and must keep the
-    # prompt-engineering fallback rather than failing.
+    # A RowTypeInfo schema has no native translation, so the request carries no
+    # derived output_config rather than failing.
     row_type = Types.ROW_NAMED(["verdict"], [Types.STRING()])
     assert "output_config" not in _request_kwargs(
         model=_CAPABLE_MODEL, output_schema=OutputSchema(output_schema=row_type)
@@ -372,7 +378,7 @@ def test_native_output_config_not_applied_for_row_type_info() -> None:
 def test_caller_output_config_wins_over_schema() -> None:
     # Only one channel carries output_config into the request, so a derived config
     # would replace the caller's outright and report nothing. The caller's value is
-    # kept and the schema stays on the prompt-engineering fallback.
+    # kept and no derived config is added.
     caller_config = {"format": {"type": "json_schema", "schema": {"type": "object"}}}
 
     sent = _request_kwargs(
@@ -573,15 +579,18 @@ def test_json_prefill_suppressed_by_derived_output_config() -> None:
     ) == (False, _CONTINUATION)
 
 
-def test_json_prefill_applied_when_schema_falls_back() -> None:
-    # Suppression keys on whether the schema reached the request, not on whether one was
-    # supplied. Keying it on the schema would strip the prefill the prompt-engineering
-    # fallback depends on, which is the case the prefill mainly exists for.
+def test_json_prefill_suppressed_on_an_incapable_model() -> None:
+    # Suppression keys on what the request ends up carrying. A schema-carrying request
+    # on an incapable model used to carry no output_config and kept its prefill; now the
+    # schema is applied whatever the model, so the two can no longer share one request
+    # and the prefill goes. This is the second user-visible consequence of dropping the
+    # capability conjunct. Nothing was prepended, so the provider's document is
+    # returned exactly as it arrived.
     assert _prefill_outcome(
         model=_INCAPABLE_MODEL,
         json_prefill=True,
         output_schema=OutputSchema(output_schema=_Answer),
-    ) == (True, _COMPLETED)
+    ) == (False, _CONTINUATION)
 
 
 def test_json_prefill_suppressed_on_prefill_unsupported_model() -> None:
@@ -755,60 +764,32 @@ def test_sampling_and_prefill_boundaries_differ() -> None:
     assert _sent_sampling("claude-sonnet-4-6", temperature=0.1)["temperature"] == 0.1
 
 
-def _judging_connection() -> tuple[AnthropicChatModelConnection, list]:
-    """A connection recording every model its request path judges for capability.
-
-    Subclassing keeps the predicate itself under test rather than standing a stub in
-    for it: the override notes what it was asked about and delegates to the real one.
-    """
-    judged: list = []
-
-    class _JudgingConnection(AnthropicChatModelConnection):
-        def supports_native_structured_output(
-            self, effective_model: str | None
-        ) -> bool:
-            judged.append(effective_model)
-            return super().supports_native_structured_output(effective_model)
-
-    connection = _JudgingConnection(api_key="dummy")
-    client = MagicMock()
-    client.messages.create.return_value = Message(
-        id="m",
-        model="claude",
-        role="assistant",
-        type="message",
-        stop_reason="end_turn",
-        content=[TextBlock(type="text", text="ok")],
-        usage=_usage(),
-    )
-    connection._client = client
-    return connection, judged
-
-
 @pytest.mark.parametrize(
     "model_kwargs",
-    [{"model": _CAPABLE_MODEL}, {"model": _INCAPABLE_MODEL}, {"model": ""}, {}],
-    ids=["capable", "incapable", "blank", "absent"],
+    [{"model": _CAPABLE_MODEL}, {"model": _INCAPABLE_MODEL}, {"model": ""}],
+    ids=["capable", "incapable", "blank"],
 )
-def test_effective_model_for_names_the_model_the_request_judges(
+def test_effective_model_for_names_the_model_the_request_issues(
     model_kwargs: Dict[str, Any],
 ) -> None:
-    """The hook names exactly the model the request path asks the predicate about.
+    """The hook names exactly the model the request is issued against.
 
     This connection reads the parameter without a fallback, so the inherited hook is
-    already the right answer. Pinning it against what the builder judges is what would
-    catch a fallback being added here without a matching override.
-    """
-    connection, judged = _judging_connection()
+    already the right answer. The branch no longer consults the capability predicate,
+    so the binding is taken against the model the request itself names: were they to
+    diverge, the gate would judge one model while the call went to another.
 
-    named = connection.effective_model_for(model_kwargs)
-    connection.chat(
-        [ChatMessage(role=MessageRole.USER, content="hi")],
-        output_schema=OutputSchema(output_schema=_Answer),
-        **model_kwargs,
+    An absent ``model`` is excluded: this connection writes no model key for one, so
+    both sides read ``None`` whatever the code does and the arm could not fail. That
+    the hook resolves an absent parameter to ``None`` is pinned in the base suite.
+    """
+    named = _connection().effective_model_for(model_kwargs)
+
+    sent = _request_kwargs(
+        output_schema=OutputSchema(output_schema=_Answer), **model_kwargs
     )
 
-    assert judged == [named]
+    assert sent["model"] == named
 
 
 # A caller-supplied output_config, kept as one object so the binding test below can tell
@@ -930,10 +911,10 @@ def test_feasibility_query_follows_the_caller_output_config() -> None:
 def test_feasibility_query_excludes_model_capability() -> None:
     """A translatable schema stays feasible on a model the allowlist rejects.
 
-    The two answers are independent, and it is the branch's separate capability
-    conjunct that leaves such a request unconstrained. A capability conjunct folded
-    into the query would be invisible to the binding test above, which moves both sides
-    at once, so it is pinned here.
+    The two answers are independent. The branch is now exactly this query, so such a
+    request carries the schema as well, and capability is the gate's business alone. A
+    capability conjunct folded into the query would be invisible to the binding test
+    above, which moves both sides at once, so it is pinned here.
     """
     conn = _connection()
     incapable = {"model": _INCAPABLE_MODEL}
@@ -944,7 +925,7 @@ def test_feasibility_query_excludes_model_capability() -> None:
         )
         is True
     )
-    assert "output_config" not in _request_kwargs(
+    assert "output_config" in _request_kwargs(
         output_schema=OutputSchema(output_schema=_Answer), **incapable
     )
 

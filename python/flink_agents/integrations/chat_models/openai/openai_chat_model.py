@@ -63,8 +63,10 @@ MAX_OPENAI_RETRIES = 2_147_483_647
 # boundary there is temporal rather than nominal. The o1 family is not uniform: o1 is
 # capable while o1-mini is not, so an "o1" prefix would admit an incapable sibling.
 #
-# A name outside every listed family reports not-capable and degrades to the prompt
-# fallback rather than failing at the provider. Within a listed family the prefix
+# A name outside every listed family reports not-capable. Under AUTO or PROMPT that
+# degrades to the prompt fallback rather than failing at the provider; under a forced
+# NATIVE the schema is sent regardless and the provider answers for it. Within a
+# listed family the prefix
 # assumes capability, so a family variant that ships without json_schema support has
 # to be excluded explicitly, either by a marker that appears in no capable name or by
 # replacing the family prefix with exact names.
@@ -86,7 +88,7 @@ def _native_output_model(output_schema: Any) -> type[BaseModel] | None:
     """The model a schema translates natively to, or ``None`` where none applies.
 
     ``None`` covers both no schema at all and a ``RowTypeInfo``, which has no native
-    translation and keeps the prompt-engineering fallback.
+    translation, so a request built from one carries no derived schema.
 
     Separate from the render below because the feasibility query has to know whether a
     schema would be sent without rendering it, and rendering raises on a schema it
@@ -106,8 +108,8 @@ def _native_response_format(output_schema: Any) -> Dict[str, Any] | None:
     """Build the OpenAI ``response_format`` for a native structured-output request.
 
     Returns ``None`` (leaving behavior unchanged) unless the schema is a ``BaseModel``
-    subclass. A ``RowTypeInfo`` schema is skipped so it keeps the prompt-engineering
-    fallback.
+    subclass. A ``RowTypeInfo`` schema is skipped, so the request carries no derived
+    ``response_format``.
 
     Raises ``TypeError`` if a ``BaseModel`` schema cannot be rendered, naming the
     schema class rather than letting the renderer's own error, which names only its
@@ -236,8 +238,9 @@ class OpenAIChatModelConnection(BaseChatModelConnection):
         See the module-level allowlist for the source of truth and the rationale for
         rejecting non-text modality variants, matching capable text families by prefix,
         and matching the gpt-4o snapshots and the o1 names exactly. A name outside
-        every listed family reports ``False`` so it degrades to the prompt-engineering
-        fallback rather than failing at the provider.
+        every listed family reports ``False``; what follows is the configured
+        strategy's to decide, degrading to the prompt-engineering fallback under
+        ``AUTO`` or ``PROMPT`` and sending the schema anyway under a forced ``NATIVE``.
         """
         if not effective_model:
             return False
@@ -259,8 +262,8 @@ class OpenAIChatModelConnection(BaseChatModelConnection):
         ``response_format``, leaving the effective model's capability out of the answer.
 
         Only a ``BaseModel`` subclass has a native translation here; a ``RowTypeInfo``
-        wrapped in ``OutputSchema``, or no schema at all, has none and keeps the
-        prompt-engineering fallback. Nothing else about the request constrains the
+        wrapped in ``OutputSchema``, or no schema at all, has none, and the request
+        carries no derived schema. Nothing else about the request constrains the
         native branch, so neither the tools nor the parameters are read: this connection
         sends a native schema alongside bound tools, and the one parameter that would
         bear on the answer is the model, which is the capability question this excludes.
@@ -304,8 +307,11 @@ class OpenAIChatModelConnection(BaseChatModelConnection):
         output_schema : OutputSchema | None
             The schema the response should conform to, or ``None`` for an unconstrained
             response. Native structured output is applied only for a ``BaseModel``
-            schema on a model the provider documents as capable; a ``RowTypeInfo``
-            schema or an incapable model keeps the prompt-engineering fallback.
+            schema; a ``RowTypeInfo`` schema carries no derived ``response_format``.
+            Whether the effective model is one the provider documents support for is
+            not asked here, so a schema supplied for a model this connection does not
+            classify as capable reaches the provider and is answered there rather than
+            dropped in silence.
         **kwargs : Any
             Additional parameters passed to the model service (e.g., temperature,
             max_tokens, etc.)
@@ -331,15 +337,16 @@ class OpenAIChatModelConnection(BaseChatModelConnection):
                     tool_spec["function"]["strict"] = strict
                     tool_spec["function"]["parameters"]["additionalProperties"] = False
 
-        # Native structured output applies only for a BaseModel schema on a model the
-        # provider documents as capable; a RowTypeInfo schema or an incapable model
-        # keeps the prompt-engineering fallback.
+        # Native structured output applies only for a BaseModel schema; a RowTypeInfo
+        # schema carries no derived response_format, and what that means for the caller
+        # is its strategy's to decide rather than this branch's.
         #
-        # The feasibility half is asked rather than restated, so a caller asking the
-        # same question gets the answer this branch acts on.
-        if self.can_apply_native_structured_output(
-            output_schema, tools, raw_kwargs
-        ) and self.supports_native_structured_output(kwargs.get("model")):
+        # The branch is exactly the feasibility query, so a caller asking the same
+        # question gets the answer this branch acts on. Whether the model is one the
+        # provider documents support for is not asked here: a caller that hands this
+        # connection a schema has already decided to send one, and re-checking would
+        # drop it from the request the caller asked to carry it.
+        if self.can_apply_native_structured_output(output_schema, tools, raw_kwargs):
             kwargs["response_format"] = _native_response_format(output_schema)
 
         response = self.client.chat.completions.create(

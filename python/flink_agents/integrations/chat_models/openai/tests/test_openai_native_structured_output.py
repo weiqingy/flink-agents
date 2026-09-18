@@ -122,22 +122,29 @@ def test_native_applied_for_basemodel_capable_model() -> None:
     assert response_format["json_schema"]["schema"]["additionalProperties"] is False
 
 
-def test_native_not_applied_for_incapable_model() -> None:
-    """Native NOT applied for a BaseModel on an incapable model (prompt fallback)."""
+def test_native_applied_for_incapable_model() -> None:
+    """A schema on a model the allowlist rejects is sent, so the provider answers.
+
+    Capability no longer gates this branch: a caller that asked for a schema gets one
+    on the wire, and a model that cannot honor it says so, rather than the request
+    being quietly unconstrained.
+    """
     conn = _connection()
     conn.chat(
         [ChatMessage(role=MessageRole.USER, content="hi")],
         model="gpt-3.5-turbo",
         output_schema=OutputSchema(output_schema=Person),
     )
-    assert "response_format" not in _create_call_kwargs(conn)
+    response_format = _create_call_kwargs(conn)["response_format"]
+    assert response_format["json_schema"]["name"] == "Person"
 
 
-def test_native_not_applied_for_pre_cutoff_snapshot() -> None:
-    """Native NOT applied for a pre-cutoff same-family gpt-4o snapshot.
+def test_native_applied_for_pre_cutoff_snapshot() -> None:
+    """A pre-cutoff same-family gpt-4o snapshot is still sent the schema.
 
     gpt-4o-2024-05-13 predates the Structured Outputs cutoff even though it shares the
-    gpt-4o prefix; treating it as capable would fail silently at the provider.
+    gpt-4o prefix. That is now the provider's objection to raise, not a reason to
+    withhold the schema here.
     """
     conn = _connection()
     conn.chat(
@@ -145,7 +152,7 @@ def test_native_not_applied_for_pre_cutoff_snapshot() -> None:
         model="gpt-4o-2024-05-13",
         output_schema=OutputSchema(output_schema=Person),
     )
-    assert "response_format" not in _create_call_kwargs(conn)
+    assert "response_format" in _create_call_kwargs(conn)
 
 
 def test_native_not_applied_when_schema_none() -> None:
@@ -271,51 +278,26 @@ def test_map_member_schema_is_accepted_and_sent_whole() -> None:
     assert response_format["json_schema"]["schema"] == to_strict_json_schema(Labelled)
 
 
-def _judging_connection() -> tuple[OpenAIChatModelConnection, list[str | None]]:
-    """A connection recording every model its request path judges for capability.
-
-    Subclassing keeps the predicate itself under test rather than standing a stub in
-    for it: the override notes what it was asked about and delegates to the real one.
-    """
-    judged: list[str | None] = []
-
-    class _JudgingConnection(OpenAIChatModelConnection):
-        def supports_native_structured_output(
-            self, effective_model: str | None
-        ) -> bool:
-            judged.append(effective_model)
-            return super().supports_native_structured_output(effective_model)
-
-    conn = _JudgingConnection(api_key="test-key", api_base_url="http://localhost")
-    mock_client = MagicMock()
-    mock_message = MagicMock()
-    mock_message.role = "assistant"
-    mock_message.content = "ok"
-    mock_message.tool_calls = None
-    mock_message.refusal = None
-    mock_client.chat.completions.create.return_value.choices = [
-        MagicMock(message=mock_message)
-    ]
-    mock_client.chat.completions.create.return_value.usage = None
-    conn._client = mock_client
-    return conn, judged
-
-
 @pytest.mark.parametrize(
     "model_kwargs",
-    [{"model": "gpt-4o-mini"}, {"model": "an-unknown-model"}, {"model": ""}, {}],
-    ids=["capable", "unknown", "blank", "absent"],
+    [{"model": "gpt-4o-mini"}, {"model": "an-unknown-model"}, {"model": ""}],
+    ids=["capable", "unknown", "blank"],
 )
-def test_effective_model_for_names_the_model_the_request_judges(
+def test_effective_model_for_names_the_model_the_request_issues(
     model_kwargs: dict[str, Any],
 ) -> None:
-    """The hook names exactly the model the request path asks the predicate about.
+    """The hook names exactly the model the request is issued against.
 
     This connection reads the parameter without a fallback, so the inherited hook is
-    already the right answer. Pinning it against what the builder judges is what would
-    catch a fallback being added here without a matching override.
+    already the right answer. The branch no longer consults the capability predicate,
+    so the binding is taken against the model the request itself names: were they to
+    diverge, the gate would judge one model while the call went to another.
+
+    An absent ``model`` is excluded: this connection writes no model key for one, so
+    both sides read ``None`` whatever the code does and the arm could not fail. That
+    the hook resolves an absent parameter to ``None`` is pinned in the base suite.
     """
-    conn, judged = _judging_connection()
+    conn = _connection()
 
     named = conn.effective_model_for(model_kwargs)
     conn.chat(
@@ -324,7 +306,7 @@ def test_effective_model_for_names_the_model_the_request_judges(
         **model_kwargs,
     )
 
-    assert judged == [named]
+    assert _create_call_kwargs(conn)["model"] == named
 
 
 def _query_recording_connection() -> tuple[OpenAIChatModelConnection, List[bool]]:
@@ -398,10 +380,10 @@ def test_feasibility_query_agrees_with_the_native_branch() -> None:
 def test_feasibility_query_excludes_model_capability() -> None:
     """A translatable schema stays feasible on a model the allowlist rejects.
 
-    The two answers are independent, and it is the branch's separate capability
-    conjunct that leaves such a request unconstrained. A capability conjunct folded
-    into the query would be invisible to the binding test above, which moves both sides
-    at once, so it is pinned here.
+    The two answers are independent. The branch is now exactly this query, so such a
+    request carries the schema as well, and capability is the gate's business alone. A
+    capability conjunct folded into the query would be invisible to the binding test
+    above, which moves both sides at once, so it is pinned here.
     """
     conn = _connection()
     incapable = {"model": "gpt-3.5-turbo"}
@@ -418,4 +400,4 @@ def test_feasibility_query_excludes_model_capability() -> None:
         output_schema=OutputSchema(output_schema=Person),
         **incapable,
     )
-    assert "response_format" not in _create_call_kwargs(conn)
+    assert "response_format" in _create_call_kwargs(conn)

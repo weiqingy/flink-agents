@@ -48,8 +48,9 @@ DEFAULT_MODEL = "qwen-plus"
 # text- vs multimodal-interface routing:
 #   https://help.aliyun.com/zh/model-studio/text-generation
 #
-# A name outside the set reports not-capable and degrades to the prompt-engineering
-# fallback rather than failing at the provider.
+# A name outside the set reports not-capable. Under AUTO or PROMPT that degrades to
+# the prompt-engineering fallback rather than failing at the provider; under a forced
+# NATIVE the schema is sent regardless and the provider answers for it.
 _NATIVE_STRUCTURED_OUTPUT_MODELS = frozenset(
     {
         "qwen3.7-max",
@@ -66,7 +67,7 @@ def _native_output_model(
     """The model a schema translates natively to, or ``None`` where none applies.
 
     ``None`` covers both no schema at all and a ``RowTypeInfo``, which has no native
-    translation and keeps the prompt-engineering fallback.
+    translation, so a request built from one carries no derived schema.
 
     Separate from the render below because the caller-conflict check needs to know
     whether a schema will be sent, and under what name, before anything is rendered.
@@ -83,8 +84,8 @@ def _native_response_format(
     """Build the DashScope ``response_format`` for a native structured-output request.
 
     Returns ``None`` (leaving behavior unchanged) unless the schema is a ``BaseModel``
-    subclass. A ``RowTypeInfo`` schema is skipped so it keeps the prompt-engineering
-    fallback.
+    subclass. A ``RowTypeInfo`` schema is skipped, so the request carries no derived
+    ``response_format``.
 
     Raises ``TypeError`` if a ``BaseModel`` schema cannot be rendered, naming the
     schema class rather than letting Pydantic's own error, which names only its
@@ -172,8 +173,10 @@ class TongyiChatModelConnection(BaseChatModelConnection):
         """Whether DashScope documents structured output for ``effective_model``.
 
         See the module-level allowlist for the source of truth and for why names are
-        matched exactly. A name outside it reports ``False`` so it degrades to the
-        prompt-engineering fallback rather than failing at the provider.
+        matched exactly. A name outside it reports ``False``; what follows is the
+        configured strategy's to decide, degrading to the prompt-engineering fallback
+        under ``AUTO`` or ``PROMPT`` and sending the schema anyway under a forced
+        ``NATIVE``.
 
         Args:
             effective_model: The model the request will be issued against, may be
@@ -211,8 +214,8 @@ class TongyiChatModelConnection(BaseChatModelConnection):
         ``response_format``, leaving the effective model's capability out of the answer.
 
         Only a ``BaseModel`` subclass has a native translation here; a ``RowTypeInfo``
-        wrapped in ``OutputSchema``, or no schema at all, has none and keeps the
-        prompt-engineering fallback.
+        wrapped in ``OutputSchema``, or no schema at all, has none, and the request
+        carries no derived schema.
 
         A caller-supplied ``response_format`` is deliberately not a condition: the
         branch answers that conflict by raising rather than by skipping, so a caller
@@ -260,10 +263,12 @@ class TongyiChatModelConnection(BaseChatModelConnection):
         output_schema : OutputSchema | None
             The schema the response should conform to, or ``None`` for an
             unconstrained response. Native structured output is applied only for a
-            ``BaseModel`` schema on a model the provider documents as capable; a
-            ``RowTypeInfo`` schema or an incapable model keeps the prompt-engineering
-            fallback. A ``response_format`` supplied alongside a schema is refused
-            rather than resolved.
+            ``BaseModel`` schema; a ``RowTypeInfo`` schema carries no derived
+            ``response_format``. Whether the effective model is one DashScope documents
+            support for is not asked here, so a schema supplied for a model this
+            connection does not classify as capable reaches the provider. A
+            ``response_format`` supplied alongside a schema is refused rather than
+            resolved.
         **kwargs : Any
             Additional parameters passed to the model service (e.g., temperature,
             max_tokens, etc.)
@@ -292,18 +297,16 @@ class TongyiChatModelConnection(BaseChatModelConnection):
 
         model_name = kwargs.pop("model", DEFAULT_MODEL)
 
-        # The predicate reads model_name rather than kwargs.get("model"): the key was
-        # popped on the line above, so a kwargs lookup would yield None on every call
-        # and report every model incapable.
-        #
-        # The feasibility half is asked rather than restated, so a caller asking the
-        # same question gets the answer this branch acts on. A payload with no native
+        # The branch is exactly the feasibility query, so a caller asking the same
+        # question gets the answer this branch acts on. A payload with no native
         # translation is reported infeasible there, so it never reaches the conflict
         # test below and cannot raise over a response_format this branch was never
         # going to write.
-        if self.can_apply_native_structured_output(
-            output_schema, tools, raw_kwargs
-        ) and self.supports_native_structured_output(model_name):
+        #
+        # Whether the model is one DashScope documents support for is not asked here: a
+        # caller that hands this connection a schema has already decided to send one,
+        # and re-checking would drop it from the request the caller asked to carry it.
+        if self.can_apply_native_structured_output(output_schema, tools, raw_kwargs):
             # Tested before the schema is rendered, because a caller who supplies both
             # a schema and a response_format has a conflict to resolve whatever the
             # schema turns out to render to, and reporting a render failure instead

@@ -87,7 +87,7 @@ def test_format_absent_without_schema() -> None:
 
 
 def test_native_not_applied_for_row_type_info() -> None:
-    """A RowTypeInfo schema has no native translation and keeps the prompt fallback."""
+    """A RowTypeInfo schema has no native translation, so no ``format`` is derived."""
     conn = _connection()
     row_type = Types.ROW_NAMED(["name"], [Types.STRING()])
     conn.chat(
@@ -143,8 +143,11 @@ def test_schema_accepted_not_rejected() -> None:
     """A schema with no native translation is answered, not refused.
 
     Rejecting is what a connection without native structured output does. This one
-    has it, so a schema form it cannot translate natively falls back to the prompt
-    engineering the caller already applied rather than raising.
+    has it, so a schema form it cannot translate natively leaves the request
+    unconstrained rather than raising here. What governs the response then is the
+    caller's configured strategy: the prompt engineering it already applied under
+    ``AUTO`` or ``PROMPT``, and under a forced ``NATIVE`` a raise at the gate before
+    this call is built.
     """
     conn = _connection()
     row_type = Types.ROW_NAMED(["name"], [Types.STRING()])
@@ -154,50 +157,26 @@ def test_schema_accepted_not_rejected() -> None:
     assert response.content == "ok"
 
 
-def _judging_connection() -> tuple[OllamaChatModelConnection, list]:
-    """A connection recording every model its request path judges for capability.
-
-    Subclassing keeps the predicate itself under test rather than standing a stub in
-    for it: the override notes what it was asked about and delegates to the real one.
-    """
-    judged: list = []
-
-    class _JudgingConnection(OllamaChatModelConnection):
-        def supports_native_structured_output(
-            self, effective_model: str | None
-        ) -> bool:
-            judged.append(effective_model)
-            return super().supports_native_structured_output(effective_model)
-
-    conn = _JudgingConnection()
-    response = MagicMock()
-    response.message.role = "assistant"
-    response.message.content = "ok"
-    response.message.tool_calls = None
-    response.prompt_eval_count = 1
-    response.eval_count = 2
-    mock_client = MagicMock()
-    mock_client.chat.return_value = response
-    conn._OllamaChatModelConnection__client = mock_client
-    return conn, judged
-
-
 @pytest.mark.parametrize(
     "model_kwargs",
     [{"model": "qwen3"}, {"model": ""}],
     ids=["named", "blank"],
 )
-def test_effective_model_for_names_the_model_the_request_judges(
+def test_effective_model_for_names_the_model_the_request_issues(
     model_kwargs: Dict[str, Any],
 ) -> None:
-    """The hook names exactly the model the request path asks the predicate about.
+    """The hook names exactly the model the request is issued against.
+
+    The hook duplicates the builder's own resolution rather than centralizing it, so
+    the two can drift. The branch no longer consults the capability predicate, so the
+    binding is taken against the model the request itself carries: were they to
+    diverge, the gate would judge one model while the call went to another.
 
     Only parameter maps that name a model are exercised: this builder pops ``model``
     with no fallback, so an absent one is a request that cannot be built rather than a
-    disagreement about which model to judge. The hook still answers ``None`` there,
-    since it resolves rather than validates.
+    disagreement about which model to judge.
     """
-    conn, judged = _judging_connection()
+    conn = _connection()
 
     named = conn.effective_model_for(model_kwargs)
     conn.chat(
@@ -206,7 +185,7 @@ def test_effective_model_for_names_the_model_the_request_judges(
         **model_kwargs,
     )
 
-    assert judged == [named]
+    assert _chat_call_kwargs(conn)["model"] == named
 
 
 def test_effective_model_for_resolves_nothing_without_a_model_param() -> None:
@@ -297,15 +276,11 @@ def test_feasibility_query_agrees_with_the_native_branch() -> None:
             assert answers == [carried], f"schema {schema}, tools {tools}"
 
 
-def test_feasibility_query_excludes_model_capability() -> None:
-    """Feasibility is answered without consulting the capability predicate.
+def _incapable_connection() -> OllamaChatModelConnection:
+    """A connection reporting every model incapable, with its client mocked.
 
-    This connection reports every model capable, so no model name can separate the two
-    answers. A subclass that reports nothing capable can: the query must still answer
-    ``True``, which fails the moment a capability conjunct is folded into the override.
-    That folding is invisible to the binding test above, which moves both sides at once.
-    The request stays unconstrained meanwhile, which is the branch's own conjunct doing
-    the work the query does not.
+    This connection reports every model capable, so overriding the predicate is the
+    only way to reach the incapable case at all.
     """
 
     class _IncapableConnection(OllamaChatModelConnection):
@@ -324,18 +299,39 @@ def test_feasibility_query_excludes_model_capability() -> None:
     mock_client = MagicMock()
     mock_client.chat.return_value = response
     conn._OllamaChatModelConnection__client = mock_client
+    return conn
 
+
+def test_feasibility_query_excludes_model_capability() -> None:
+    """Feasibility is answered without consulting the capability predicate.
+
+    This connection reports every model capable, so no model name can separate the two
+    answers. A subclass that reports nothing capable can: the query must still answer
+    ``True``, which fails the moment a capability conjunct is folded into the override.
+    That folding is invisible to the binding test above, which moves both sides at once.
+    """
     assert (
-        conn.can_apply_native_structured_output(
+        _incapable_connection().can_apply_native_structured_output(
             OutputSchema(output_schema=Person), [], {"model": "qwen3"}
         )
         is True
     )
 
+
+def test_schema_is_sent_when_the_model_is_reported_incapable() -> None:
+    """A schema travels natively even where the connection reports the model incapable.
+
+    The branch no longer consults the capability predicate, so the schema reaches the
+    server and the server is what answers for it. Without this, nothing here would
+    notice a capability conjunct being reintroduced.
+    """
+    conn = _incapable_connection()
+
     conn.chat(
         _messages(), model="qwen3", output_schema=OutputSchema(output_schema=Person)
     )
-    assert "format" not in _chat_call_kwargs(conn)
+
+    assert _chat_call_kwargs(conn)["format"]["properties"].keys() == {"name", "age"}
 
 
 def test_feasibility_query_is_asked_with_the_unstripped_kwargs() -> None:

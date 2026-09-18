@@ -130,8 +130,9 @@ def convert_to_anthropic_system_prompts(
 # also has to retain the minor version: "claude-opus-4" would capture
 # claude-opus-4-1-20250805, which predates the cutoff and is not capable.
 #
-# A name outside both sets reports not-capable and degrades to the prompt-engineering
-# fallback rather than failing at the provider.
+# A name outside both sets reports not-capable. Under AUTO or PROMPT that degrades to
+# the prompt-engineering fallback rather than failing at the provider; under a forced
+# NATIVE the schema is sent regardless and the provider answers for it.
 _NATIVE_STRUCTURED_OUTPUT_MODELS = frozenset(
     {
         "claude-opus-4-6",
@@ -195,7 +196,7 @@ def _supports_json_prefill(effective_model: str | None) -> bool:
     opposite way to ``supports_native_structured_output``: a rejecting model this list
     has not caught up with is prefilled and answered with a 400, where an unrecognized
     name on the structured-output path degrades silently to the prompt-engineering
-    fallback instead.
+    fallback instead under ``AUTO`` or ``PROMPT``.
     """
     return effective_model not in _PREFILL_UNSUPPORTED_MODELS
 
@@ -262,7 +263,7 @@ def _native_output_model(output_schema: Any) -> type[BaseModel] | None:
     """The model a schema translates natively to, or ``None`` where none applies.
 
     ``None`` covers both no schema at all and a ``RowTypeInfo``, which has no native
-    translation and keeps the prompt-engineering fallback.
+    translation, so a request built from one carries no derived schema.
 
     Separate from the render below because the feasibility query has to know whether a
     schema would be sent without rendering it, and rendering raises on a schema it
@@ -282,8 +283,8 @@ def _native_output_config(output_schema: Any) -> Dict[str, Any] | None:
     """Build the Anthropic ``output_config`` for a native structured-output request.
 
     Returns ``None`` (leaving the request unchanged) unless the schema is a
-    ``BaseModel`` subclass. A ``RowTypeInfo`` schema is skipped so it keeps the
-    prompt-engineering fallback.
+    ``BaseModel`` subclass. A ``RowTypeInfo`` schema is skipped, so the request carries
+    no derived ``output_config``.
 
     Anthropic's format object carries only the schema and its type, so it shares no
     shape with the providers that nest the schema under a named, strict
@@ -366,8 +367,10 @@ class AnthropicChatModelConnection(BaseChatModelConnection):
 
         See the module-level allowlists for the source of truth and for why a
         4.5-generation alias also matches the dated snapshot behind it while every other
-        name is matched exactly. A name outside both reports ``False`` so it degrades to
-        the prompt-engineering fallback rather than failing at the provider.
+        name is matched exactly. A name outside both reports ``False``; what follows is
+        the configured strategy's to decide, degrading to the prompt-engineering
+        fallback under ``AUTO`` or ``PROMPT`` and sending the schema anyway under a
+        forced ``NATIVE``.
 
         Reads no instance state, so capability stays answerable independently of how
         the connection was configured.
@@ -392,8 +395,8 @@ class AnthropicChatModelConnection(BaseChatModelConnection):
         Two conditions. Only a ``BaseModel`` subclass has a native translation here; a
         ``RowTypeInfo`` wrapped in ``OutputSchema``, or no schema at all, has none. And
         a caller-supplied ``output_config`` wins: it is the caller being explicit about
-        the exact parameter the native branch writes, so the schema keeps the
-        prompt-engineering fallback rather than the two competing on one request.
+        the exact parameter the native branch writes, so no derived one is added rather
+        than the two competing on one request.
 
         The tools are not read; a bound tool does not stop this connection sending a
         schema.
@@ -442,9 +445,12 @@ class AnthropicChatModelConnection(BaseChatModelConnection):
         output_schema : OutputSchema | None
             The schema the response should conform to, or ``None`` for an unconstrained
             response. Native structured output is applied only for a ``BaseModel``
-            schema on a model the provider documents as capable, and only when the
-            caller has not already supplied ``output_config``. Any other combination
-            sends no derived schema and keeps the prompt-engineering fallback.
+            schema, and only when the caller has not already supplied
+            ``output_config``. Any other combination sends no derived schema. Whether
+            the effective model is one Anthropic documents support for is not asked
+            here, so a schema supplied for a model this connection does not classify as
+            capable reaches the provider and is answered there rather than dropped in
+            silence.
         **kwargs : Any
             Additional parameters passed to the model service (e.g., temperature,
             max_tokens, etc.). ``json_prefill`` is consumed here rather than
@@ -476,21 +482,22 @@ class AnthropicChatModelConnection(BaseChatModelConnection):
         # it in place would reach messages.create as an unknown request field.
         json_prefill = kwargs.pop("json_prefill", False)
 
-        # Native structured output applies only for a BaseModel schema on a model the
-        # provider documents as capable, and only where the caller supplied no
-        # output_config of its own. That value is the caller being explicit about the
-        # exact parameter this branch writes, so it wins and the schema keeps the
-        # prompt-engineering fallback; writing over it would drop the caller's value
-        # with no error and no other trace.
+        # Native structured output applies only for a BaseModel schema, and only where
+        # the caller supplied no output_config of its own. That value is the caller
+        # being explicit about the exact parameter this branch writes, so it wins and no
+        # derived one is added; writing over it would drop the caller's value with no
+        # error and no other trace. What either skip means for the caller is its
+        # strategy's to decide, not this branch's.
         #
-        # Both feasibility conditions are asked rather than restated, so a caller
-        # asking the same question gets the answer this branch acts on. The schema is
-        # rendered only once that answer is in, because rendering raises on a schema it
-        # cannot express, and rendering one this branch is about to discard would fail
-        # a request the caller had already steered away from the derived config.
-        if self.can_apply_native_structured_output(
-            output_schema, tools, raw_kwargs
-        ) and self.supports_native_structured_output(kwargs.get("model")):
+        # The branch is exactly the feasibility query, so a caller asking the same
+        # question gets the answer this branch acts on. Whether the model is one
+        # Anthropic documents as capable is not asked here: a caller that hands this
+        # connection a schema has already decided to send one, and re-checking would
+        # drop it from the request the caller asked to carry it. The schema is rendered
+        # only once that answer is in, because rendering raises on a schema it cannot
+        # express, and rendering one this branch is about to discard would fail a
+        # request the caller had already steered away from the derived config.
+        if self.can_apply_native_structured_output(output_schema, tools, raw_kwargs):
             kwargs["output_config"] = _native_output_config(output_schema)
 
         # JSON prefill appends a prefilled assistant "{" message to steer the model
@@ -506,8 +513,8 @@ class AnthropicChatModelConnection(BaseChatModelConnection):
         # Evaluated after the block above so the output_config test covers both ways one
         # can reach the request: derived from output_schema there, or supplied by the
         # caller. It keys on what the request ends up carrying rather than on what was
-        # supplied, so a schema that could not be sent natively keeps the prefill its
-        # prompt-engineering fallback depends on - unless the caller supplied an
+        # supplied, so a schema that could not be sent natively keeps the prefill that
+        # a prompt-described schema depends on - unless the caller supplied an
         # output_config of its own.
         prefill_applied = (
             json_prefill is True

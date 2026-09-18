@@ -39,7 +39,7 @@ def _native_output_model(output_schema: Any) -> type[BaseModel] | None:
     """The model a schema translates natively to, or ``None`` where none applies.
 
     ``None`` covers both no schema at all and a ``RowTypeInfo``, which has no native
-    translation and keeps the prompt-engineering fallback.
+    translation, so a request built from one carries no derived schema.
 
     Separate from the render below because the feasibility query has to know whether a
     schema would be sent without rendering it, and rendering raises on a schema it
@@ -59,8 +59,8 @@ def _native_format(output_schema: Any) -> Dict[str, Any] | None:
     """Build the Ollama ``format`` payload for a native structured-output request.
 
     Returns ``None`` (leaving the request unconstrained) unless the schema is a
-    ``BaseModel`` subclass. A ``RowTypeInfo`` schema is skipped so it keeps the
-    prompt-engineering fallback.
+    ``BaseModel`` subclass. A ``RowTypeInfo`` schema is skipped, so the request carries
+    no derived ``format``.
     """
     model = _native_output_model(output_schema)
     if model is None:
@@ -151,8 +151,8 @@ class OllamaChatModelConnection(BaseChatModelConnection):
         leaving the effective model's capability out of the answer.
 
         Only a ``BaseModel`` subclass has a native translation here; a ``RowTypeInfo``
-        wrapped in ``OutputSchema``, or no schema at all, has none and keeps the
-        prompt-engineering fallback. Since this connection's capability predicate is
+        wrapped in ``OutputSchema``, or no schema at all, has none, and the request
+        carries no derived schema. Since this connection's capability predicate is
         unconditionally true, the schema form is the whole of what it can report
         infeasible.
 
@@ -200,7 +200,10 @@ class OllamaChatModelConnection(BaseChatModelConnection):
             The schema the response should conform to, or ``None`` for an unconstrained
             response. A ``BaseModel`` schema is sent as Ollama's native ``format``
             argument so the server constrains decoding to it; any other schema form,
-            notably a ``RowTypeInfo``, keeps the prompt-engineering fallback.
+            notably a ``RowTypeInfo``, leaves the request unconstrained. What governs
+            the response then depends on the caller's configured strategy: the
+            prompt-engineering fallback under ``AUTO`` or ``PROMPT``, and a raise at
+            the gate under a forced ``NATIVE``.
         **kwargs : Any
             Additional parameters passed to the model service (e.g., temperature,
             num_ctx, etc.)
@@ -226,17 +229,19 @@ class OllamaChatModelConnection(BaseChatModelConnection):
         model_name = kwargs.pop("model")
 
         # Native structured output applies only for a BaseModel schema; any other schema
-        # form, such as a RowTypeInfo wrapped in OutputSchema, keeps the
-        # prompt-engineering fallback. The schema is a request field of its own rather
-        # than a sampling option, so it is passed as the format argument, which is
-        # omitted altogether when no native translation applies.
+        # form, such as a RowTypeInfo wrapped in OutputSchema, carries no derived
+        # schema, and what that means for the caller is its strategy's to decide rather
+        # than this branch's. The schema is a request field of its own rather than a
+        # sampling option, so it is passed as the format argument, which is omitted
+        # altogether when no native translation applies.
         #
-        # The feasibility half is asked rather than restated, so a caller asking the
-        # same question gets the answer this branch acts on.
+        # The branch is exactly the feasibility query, so a caller asking the same
+        # question gets the answer this branch acts on. This connection's own capability
+        # predicate is unconditionally true, so the conjunct that stood here decided
+        # nothing for it. A subclass that overrides that predicate to false would have
+        # been skipped before and is not now.
         format_kwargs: Dict[str, Any] = {}
-        if self.can_apply_native_structured_output(
-            output_schema, tools, raw_kwargs
-        ) and self.supports_native_structured_output(model_name):
+        if self.can_apply_native_structured_output(output_schema, tools, raw_kwargs):
             format_kwargs = {"format": _native_format(output_schema)}
 
         response = self.client.chat(

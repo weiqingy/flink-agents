@@ -167,7 +167,7 @@ def _native_output_model(
     """The model a schema translates natively to, or ``None`` where none applies.
 
     ``None`` covers both no schema at all and a ``RowTypeInfo``, which has no native
-    translation here and keeps the prompt-engineering fallback.
+    translation here, so a request built from one carries no derived schema.
 
     Separate from the render below because the caller-conflict check needs to know
     whether a schema will be sent, and under what name, before anything is rendered.
@@ -431,8 +431,8 @@ class WatsonxChatModelConnection(BaseChatModelConnection):
         ``response_format``, leaving the effective model's capability out of the answer.
 
         Only a ``BaseModel`` subclass has a native translation here; a ``RowTypeInfo``
-        wrapped in ``OutputSchema``, or no schema at all, has none and keeps the
-        prompt-engineering fallback. Since this connection's capability predicate is
+        wrapped in ``OutputSchema``, or no schema at all, has none, and the request
+        carries no derived schema. Since this connection's capability predicate is
         unconditionally true, the schema form is the whole of what it can report
         infeasible.
 
@@ -475,9 +475,12 @@ class WatsonxChatModelConnection(BaseChatModelConnection):
 
         A ``BaseModel`` ``output_schema`` is sent as the ``response_format`` request
         parameter. Any other schema form, notably a ``RowTypeInfo``, has no native
-        translation here and keeps the prompt-engineering fallback. Where the schema
-        is sent natively, a caller-supplied ``response_format`` carrying a value
-        conflicts with it and raises ``ValueError``. Declaring the parameter keeps a
+        translation here and leaves the request unconstrained. What governs the
+        response then depends on the caller's configured strategy: the
+        prompt-engineering fallback under ``AUTO`` or ``PROMPT``, and a raise at the
+        gate under a forced ``NATIVE``. Where the schema is sent natively, a
+        caller-supplied ``response_format`` carrying a value conflicts with it and
+        raises ``ValueError``. Declaring the parameter keeps a
         caller-supplied schema out of ``**kwargs``, which is forwarded to the
         provider SDK.
 
@@ -515,14 +518,16 @@ class WatsonxChatModelConnection(BaseChatModelConnection):
             raise ValueError(msg)
 
         # Native structured output applies only for a BaseModel schema; any other
-        # schema form, such as a RowTypeInfo wrapped in OutputSchema, keeps the
-        # prompt-engineering fallback.
+        # schema form, such as a RowTypeInfo wrapped in OutputSchema, carries no derived
+        # response_format, and what that means for the caller is its strategy's to
+        # decide rather than this branch's.
         #
-        # The feasibility half is asked rather than restated, so a caller asking the
-        # same question gets the answer this branch acts on.
-        if self.can_apply_native_structured_output(
-            output_schema, tools, raw_kwargs
-        ) and self.supports_native_structured_output(model_name):
+        # The branch is exactly the feasibility query, so a caller asking the same
+        # question gets the answer this branch acts on. This connection's own capability
+        # predicate is unconditionally true, so the conjunct that stood here decided
+        # nothing for it. A subclass that overrides that predicate to false would have
+        # been skipped before and is not now.
+        if self.can_apply_native_structured_output(output_schema, tools, raw_kwargs):
             native_model = _native_output_model(output_schema)
             # A caller reaches the same request field through either channel, and both
             # have already merged into request_params. Only the branch that sends a

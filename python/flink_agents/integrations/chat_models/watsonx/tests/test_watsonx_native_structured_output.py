@@ -99,11 +99,13 @@ def _connection() -> WatsonxChatModelConnection:
 
 def _mocked_connection(
     monkeypatch: pytest.MonkeyPatch,
+    factory: Callable[[], WatsonxChatModelConnection] = _connection,
 ) -> Tuple[WatsonxChatModelConnection, MagicMock]:
     """A connection whose provider call is a mock, returned alongside it.
 
     Assigning the private client is what keeps the call offline: the connection
-    builds a real one lazily on first use otherwise.
+    builds a real one lazily on first use otherwise. ``factory`` builds the
+    connection, so a subclass under test shares this wiring instead of repeating it.
     """
     provider_model = MagicMock()
     provider_model.chat.return_value = CHAT_RESPONSE
@@ -111,9 +113,34 @@ def _mocked_connection(
         "flink_agents.integrations.chat_models.watsonx.watsonx_chat_model.ModelInference",
         MagicMock(return_value=provider_model),
     )
-    connection = _connection()
+    connection = factory()
     connection._client = MagicMock()
     return connection, provider_model
+
+
+def _incapable_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Tuple[WatsonxChatModelConnection, MagicMock]:
+    """A connection reporting every model incapable, with its provider call mocked.
+
+    This connection reports every model capable, so overriding the predicate is the
+    only way to reach the incapable case at all.
+    """
+
+    class _IncapableConnection(WatsonxChatModelConnection):
+        def supports_native_structured_output(
+            self, effective_model: str | None
+        ) -> bool:
+            return False
+
+    return _mocked_connection(
+        monkeypatch,
+        lambda: _IncapableConnection(
+            url="https://us-south.ml.cloud.ibm.com",
+            api_key="fake-key",
+            project_id="fake-project",
+        ),
+    )
 
 
 def _sent_params(
@@ -176,7 +203,7 @@ def test_params_omit_response_format_without_schema(
 def test_row_type_info_schema_returns_and_sends_no_response_format(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A RowTypeInfo schema is accepted and left to the prompt-engineering fallback.
+    """A RowTypeInfo schema is accepted and leaves the request unconstrained.
 
     Both halves are asserted. Reporting native capability exempts this connection
     from the tree-wide rule that a connection rejects a schema it cannot translate,
@@ -361,36 +388,24 @@ def test_chat_with_output_schema() -> None:
     assert Answer(**parsed).verdict is not None
 
 
-def _judging_connection(
+def _model_inference_recording_connection(
     monkeypatch: pytest.MonkeyPatch,
-) -> Tuple[WatsonxChatModelConnection, list]:
-    """A mocked connection recording every model its request path judges.
+) -> Tuple[WatsonxChatModelConnection, MagicMock]:
+    """A mocked connection returned with the ``ModelInference`` stub it builds through.
 
-    Subclassing keeps the predicate itself under test rather than standing a stub in
-    for it: the override notes what it was asked about and delegates to the real one.
+    The model a request is issued against is the ``model_id`` the connection hands
+    ``ModelInference``, so the stub is what the binding test reads it from.
     """
-    judged: list = []
-
-    class _JudgingConnection(WatsonxChatModelConnection):
-        def supports_native_structured_output(
-            self, effective_model: str | None
-        ) -> bool:
-            judged.append(effective_model)
-            return super().supports_native_structured_output(effective_model)
-
     provider_model = MagicMock()
     provider_model.chat.return_value = CHAT_RESPONSE
+    model_inference = MagicMock(return_value=provider_model)
     monkeypatch.setattr(
         "flink_agents.integrations.chat_models.watsonx.watsonx_chat_model.ModelInference",
-        MagicMock(return_value=provider_model),
+        model_inference,
     )
-    connection = _JudgingConnection(
-        url="https://us-south.ml.cloud.ibm.com",
-        api_key="fake-key",
-        project_id="fake-project",
-    )
+    connection = _connection()
     connection._client = MagicMock()
-    return connection, judged
+    return connection, model_inference
 
 
 def test_effective_model_for_applies_the_default_model() -> None:
@@ -434,17 +449,17 @@ def test_effective_model_for_does_not_consume_the_model() -> None:
     [{"model": "no-such-model"}, {"model": ""}, {}],
     ids=["named", "blank", "absent"],
 )
-def test_effective_model_for_names_the_model_the_request_judges(
+def test_effective_model_for_names_the_model_the_request_issues(
     monkeypatch: pytest.MonkeyPatch, model_kwargs: Dict[str, Any]
 ) -> None:
-    """The hook names exactly the model the request path asks the predicate about.
+    """The hook names exactly the model the request is issued against.
 
-    Capability here is unconditional, so the predicate's answer cannot reveal a
-    disagreement; only the argument it was handed can. A fresh connection per case is
-    what makes the single-element comparison also an assertion that the predicate was
-    reached at all.
+    The branch no longer consults the capability predicate, so the binding is taken
+    against the ``model_id`` the request carries: were they to diverge, the gate would
+    judge one model while the call went to another. Both apply the same default for an
+    absent parameter, which is the case that would drift first.
     """
-    connection, judged = _judging_connection(monkeypatch)
+    connection, model_inference = _model_inference_recording_connection(monkeypatch)
 
     named = connection.effective_model_for(model_kwargs)
     connection.chat(
@@ -453,7 +468,7 @@ def test_effective_model_for_names_the_model_the_request_judges(
         **model_kwargs,
     )
 
-    assert judged == [named]
+    assert model_inference.call_args.kwargs["model_id"] == named
 
 
 def _add(a: int, b: int) -> int:
@@ -557,28 +572,8 @@ def test_feasibility_query_excludes_model_capability(
     answers. A subclass that reports nothing capable can: the query must still answer
     ``True``, which fails the moment a capability conjunct is folded into the override.
     That folding is invisible to the binding test above, which moves both sides at once.
-    The payload stays unconstrained meanwhile, which is the branch's own conjunct doing
-    the work the query does not.
     """
-
-    class _IncapableConnection(WatsonxChatModelConnection):
-        def supports_native_structured_output(
-            self, effective_model: str | None
-        ) -> bool:
-            return False
-
-    provider_model = MagicMock()
-    provider_model.chat.return_value = CHAT_RESPONSE
-    monkeypatch.setattr(
-        "flink_agents.integrations.chat_models.watsonx.watsonx_chat_model.ModelInference",
-        MagicMock(return_value=provider_model),
-    )
-    conn = _IncapableConnection(
-        url="https://us-south.ml.cloud.ibm.com",
-        api_key="fake-key",
-        project_id="fake-project",
-    )
-    conn._client = MagicMock()
+    conn, _ = _incapable_connection(monkeypatch)
 
     assert (
         conn.can_apply_native_structured_output(
@@ -587,13 +582,25 @@ def test_feasibility_query_excludes_model_capability(
         is True
     )
 
+
+def test_schema_is_sent_when_the_model_is_reported_incapable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A schema travels natively even where the connection reports the model incapable.
+
+    The branch no longer consults the capability predicate, so the schema reaches the
+    endpoint and the endpoint is what answers for it. Without this, nothing here would
+    notice a capability conjunct being reintroduced.
+    """
+    conn, provider_model = _incapable_connection(monkeypatch)
+
     conn.chat(
         [ChatMessage(role=MessageRole.USER, content="Hello!")],
         output_schema=OutputSchema(output_schema=Report),
     )
-    assert "response_format" not in (
-        provider_model.chat.call_args.kwargs["params"] or {}
-    )
+
+    params = provider_model.chat.call_args.kwargs["params"] or {}
+    assert params["response_format"]["json_schema"]["name"] == "Report"
 
 
 def test_feasibility_query_ignores_a_caller_response_format() -> None:
