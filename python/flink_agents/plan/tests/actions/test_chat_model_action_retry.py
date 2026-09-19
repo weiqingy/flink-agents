@@ -19,16 +19,20 @@
 
 import asyncio
 import time
-from typing import Any, Sequence
+from typing import Any, Dict, List, Sequence
 from unittest.mock import MagicMock, call
 from uuid import uuid4
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from flink_agents.api.agents.agent import STRUCTURED_OUTPUT
 from flink_agents.api.agents.react_agent import OutputSchema
 from flink_agents.api.chat_message import ChatMessage, MessageRole
+from flink_agents.api.chat_models.chat_model import (
+    BaseChatModelConnection,
+    BaseChatModelSetup,
+)
 from flink_agents.api.core_options import (
     AgentExecutionOptions,
     ErrorHandlingStrategy,
@@ -36,6 +40,8 @@ from flink_agents.api.core_options import (
 from flink_agents.api.events.chat_event import ChatResponseEvent
 from flink_agents.api.events.tool_event import ToolRequestEvent, ToolResponseEvent
 from flink_agents.api.metric_group import Counter, MetricGroup
+from flink_agents.api.prompts.prompt import Prompt
+from flink_agents.api.tools.tool import Tool, ToolType
 from flink_agents.api.trace import (
     ExecutionEntityTypes,
     ExecutionProblemCategories,
@@ -120,8 +126,14 @@ def _create_mock_runner_context(
     max_retries: int = 3,
     retry_wait_interval_sec: int = 1,
     error_handling_strategy: ErrorHandlingStrategy = ErrorHandlingStrategy.RETRY,
+    *,
+    chat_async: bool = False,
 ) -> tuple[MagicMock, list, _MockMetricGroup, _MockMemoryObject]:
     """Create a mock RunnerContext with configurable retry settings.
+
+    ``chat_async`` selects which durable seam the action uses. It defaults to False
+    here, unlike the production default, so that a test opts in to the async seam
+    deliberately; both seams are wired either way.
 
     Returns (ctx, sent_events, action_metric_group, sensory_memory).
     """
@@ -129,13 +141,20 @@ def _create_mock_runner_context(
     metric_group = _MockMetricGroup()
     sensory_memory = _MockMemoryObject()
     chat_model.model = "configured-model"
+    # Stated rather than left to the mock default. An unstubbed MagicMock attribute
+    # answers this gate with a truthy mock, which would send every schema-carrying
+    # test down the native finalization path, resolve chat_structured to another
+    # auto-created mock, and fail far from the cause. Tests that want the native
+    # path override this after this helper returns.
+    if isinstance(chat_model, MagicMock):
+        chat_model.will_apply_native_structured_output = MagicMock(return_value=False)
 
     config = MagicMock()
     option_values = {
         id(AgentExecutionOptions.ERROR_HANDLING_STRATEGY): error_handling_strategy,
         id(AgentExecutionOptions.MAX_RETRIES): max_retries,
         id(AgentExecutionOptions.RETRY_WAIT_INTERVAL): retry_wait_interval_sec,
-        id(AgentExecutionOptions.CHAT_ASYNC): False,
+        id(AgentExecutionOptions.CHAT_ASYNC): chat_async,
     }
     config.get = MagicMock(
         side_effect=lambda option: option_values.get(
@@ -152,6 +171,11 @@ def _create_mock_runner_context(
     ctx.durable_execute = MagicMock(
         side_effect=lambda fn, *args, **kwargs: fn(*args, **kwargs)
     )
+
+    async def _dispatch_async(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        return fn(*args, **kwargs)
+
+    ctx.durable_execute_async = MagicMock(side_effect=_dispatch_async)
 
     return ctx, sent_events, metric_group, sensory_memory
 
@@ -694,3 +718,438 @@ class TestProcessToolResponsePromptArgsForwarding:
         tool_message = captured_messages[0][-1]
         assert tool_message.role == MessageRole.TOOL
         assert tool_message.content == "Tool `query_order` execute failed."
+
+
+# The conversion instruction the schema-carrying call appends. Spelled out here
+# rather than imported from the action so the assertion pins the exact words a
+# provider receives: a test that imported the constant would agree with any edit to
+# it, including one that emptied it.
+_FINALIZE_DIRECTIVE_TEXT = (
+    "Convert the previous assistant response into the required structured output"
+    " format. Preserve its meaning and do not add or infer any new information."
+)
+
+
+class TestNativeStructuredOutputFinalization:
+    """Tests for the schema-carrying call issued once the loop settles on an answer."""
+
+    def _run(self, ctx: Any, output_schema: OutputSchema) -> None:
+        asyncio.run(
+            chat(
+                uuid4(),
+                "test-model",
+                [ChatMessage(role=MessageRole.USER, content="hi")],
+                {},
+                output_schema,
+                ctx,
+            )
+        )
+
+    def _native_chat_model(self) -> MagicMock:
+        chat_model = MagicMock()
+        chat_model.chat = MagicMock(
+            return_value=ChatMessage(
+                role=MessageRole.ASSISTANT, content="the answer is 42"
+            )
+        )
+        chat_model.chat_structured = MagicMock(
+            return_value=ChatMessage(
+                role=MessageRole.ASSISTANT, content='{"result": 42}'
+            )
+        )
+        return chat_model
+
+    def _native_context(self, chat_model: MagicMock) -> tuple:
+        ctx, sent_events, metric_group, memory = _create_mock_runner_context(
+            chat_model, max_retries=0, retry_wait_interval_sec=0
+        )
+        chat_model.will_apply_native_structured_output = MagicMock(return_value=True)
+        return ctx, sent_events, metric_group, memory
+
+    def test_native_schema_parses_the_finalization_response(self) -> None:
+        chat_model = self._native_chat_model()
+        ctx, sent_events, _, _ = self._native_context(chat_model)
+
+        self._run(ctx, OutputSchema(output_schema=_StructuredResult))
+
+        # Both call counts, not only the final value: an unstubbed chat_structured
+        # resolves to an auto-created mock that fails somewhere else entirely.
+        assert chat_model.chat.call_count == 1
+        assert chat_model.chat_structured.call_count == 1
+        # The loop's answer is prose no parser could read, so only the finalization
+        # response can satisfy this.
+        assert len(sent_events) == 1
+        assert sent_events[0].response.extra_args[STRUCTURED_OUTPUT].result == 42
+
+    def test_schema_kept_in_the_prompt_issues_no_finalization_call(self) -> None:
+        chat_model = MagicMock()
+        chat_model.chat = MagicMock(
+            return_value=ChatMessage(
+                role=MessageRole.ASSISTANT, content='{"result": 42}'
+            )
+        )
+        chat_model.chat_structured = MagicMock()
+        ctx, sent_events, _, _ = _create_mock_runner_context(
+            chat_model, max_retries=0, retry_wait_interval_sec=0
+        )
+        # Stated rather than left to the helper's default: a schema that will not
+        # travel natively is the case that must cost exactly what it always has.
+        chat_model.will_apply_native_structured_output = MagicMock(return_value=False)
+        schema = OutputSchema(output_schema=_StructuredResult)
+
+        self._run(ctx, schema)
+
+        # The gate was consulted and answered no. Without this the test cannot tell
+        # a suppressed finalization from an action that never asks the question.
+        chat_model.will_apply_native_structured_output.assert_called_once_with(schema)
+        chat_model.chat_structured.assert_not_called()
+        assert chat_model.chat.call_count == 1
+        assert len(sent_events) == 1
+        assert sent_events[0].response.extra_args[STRUCTURED_OUTPUT].result == 42
+
+    def test_finalization_call_appends_the_final_answer_and_the_directive(self) -> None:
+        chat_model = self._native_chat_model()
+        loop_answer = chat_model.chat.return_value
+        ctx, _, _, _ = self._native_context(chat_model)
+        schema = OutputSchema(output_schema=_StructuredResult)
+
+        self._run(ctx, schema)
+
+        sent_messages, sent_schema = chat_model.chat_structured.call_args.args
+        assert [m.content for m in sent_messages] == [
+            "hi",
+            "the answer is 42",
+            _FINALIZE_DIRECTIVE_TEXT,
+        ]
+        assert sent_messages[1] is loop_answer
+        assert sent_messages[2].role == MessageRole.USER
+        assert sent_schema is schema
+        # The schema travels through the tool-free channel, so the tool-binding
+        # chat() path runs once for the loop and never for the conversion.
+        assert chat_model.chat.call_count == 1
+
+    def test_rejected_finish_reason_issues_no_finalization_call(self) -> None:
+        chat_model = MagicMock()
+        chat_model.chat = MagicMock(
+            return_value=ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content="partial answ",
+                extra_args={"finish_reason": "length"},
+            )
+        )
+        chat_model.chat_structured = MagicMock()
+        ctx, sent_events, _, _ = self._native_context(chat_model)
+        schema = OutputSchema(output_schema=_StructuredResult)
+
+        with pytest.raises(ValueError, match="(?i)truncat"):
+            self._run(ctx, schema)
+
+        # An answer the model never finished is abandoned before anything is paid to
+        # convert it: the gate is asked, and the rejection still stops the call.
+        chat_model.will_apply_native_structured_output.assert_called_once_with(schema)
+        chat_model.chat_structured.assert_not_called()
+        assert len(sent_events) == 0
+
+    def test_tool_call_response_issues_no_finalization_call(self) -> None:
+        tool_calls = [{"id": "call-1", "function": {"name": "f", "arguments": {}}}]
+        chat_model = MagicMock()
+        chat_model.chat = MagicMock(
+            return_value=ChatMessage(
+                role=MessageRole.ASSISTANT, content="", tool_calls=tool_calls
+            )
+        )
+        chat_model.chat_structured = MagicMock()
+        ctx, sent_events, _, _ = self._native_context(chat_model)
+        schema = OutputSchema(output_schema=_StructuredResult)
+
+        self._run(ctx, schema)
+
+        # The loop is still asking for tools, so the answer to convert does not exist
+        # yet: the gate is asked, and the outstanding tool calls still stop the call.
+        chat_model.will_apply_native_structured_output.assert_called_once_with(schema)
+        chat_model.chat_structured.assert_not_called()
+        assert len(sent_events) == 1
+        assert isinstance(sent_events[0], ToolRequestEvent)
+
+    def test_finalization_call_emits_its_own_llm_span(self) -> None:
+        chat_model = self._native_chat_model()
+        ctx, _, _, _ = self._native_context(chat_model)
+
+        self._run(ctx, OutputSchema(output_schema=_StructuredResult))
+
+        # A span covers one chat call, not one invocation: two calls reached the
+        # provider, so two pairs are reported.
+        llm_span = call(ExecutionEntityTypes.LLM, "test-model", _LLM_METADATA)
+        assert ctx.report_execution_started.call_args_list.count(llm_span) == 2
+        assert ctx.report_execution_succeeded.call_args_list.count(llm_span) == 2
+        ctx.report_execution_failed.assert_not_called()
+
+    def test_finalization_call_failure_is_reported_as_a_model_call_failure(
+        self,
+    ) -> None:
+        chat_model = self._native_chat_model()
+        chat_model.chat_structured = MagicMock(
+            side_effect=RuntimeError("conversion call exploded")
+        )
+        ctx, sent_events, _, _ = self._native_context(chat_model)
+
+        with pytest.raises(RuntimeError, match="conversion call exploded"):
+            self._run(ctx, OutputSchema(output_schema=_StructuredResult))
+
+        # Without a span of its own the failure would land nowhere: the loop call's
+        # success would be the last word and the error attributed to nothing.
+        ctx.report_execution_failed.assert_called_once()
+        failed_args = ctx.report_execution_failed.call_args.args
+        assert failed_args[0] == ExecutionEntityTypes.LLM
+        assert failed_args[1] == "test-model"
+        assert failed_args[2] == _LLM_METADATA
+        assert failed_args[-1] == ExecutionProblemCategories.MODEL_CALL_FAILED
+        # Both calls started; only the loop's succeeded.
+        llm_span = call(ExecutionEntityTypes.LLM, "test-model", _LLM_METADATA)
+        assert ctx.report_execution_started.call_args_list.count(llm_span) == 2
+        assert ctx.report_execution_succeeded.call_args_list.count(llm_span) == 1
+        assert len(sent_events) == 0
+
+
+class _StubTool(Tool):
+    """Minimal tool; only its presence in the bound tool list matters."""
+
+    @classmethod
+    def tool_type(cls) -> ToolType:
+        return ToolType.FUNCTION
+
+    def call(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+class _RecordingConnection(BaseChatModelConnection):
+    """Connection recording the messages of every request it receives.
+
+    Separates the two channels by whether a schema came with the request, so a test
+    can assert what each one carries.
+    """
+
+    unconstrained_requests: List[List[ChatMessage]] = Field(default_factory=list)
+    unconstrained_tools: List[Tool] | None = None
+    schema_carrying_requests: List[List[ChatMessage]] = Field(default_factory=list)
+    schema_carrying_tools: List[Tool] | None = None
+
+    def chat(
+        self,
+        messages: Sequence[ChatMessage],
+        tools: List[Tool] | None = None,
+        output_schema: OutputSchema | None = None,
+        **kwargs: Any,
+    ) -> ChatMessage:
+        # Recorded exactly as received rather than normalized through ``or []``, so a
+        # test can tell an empty list from an absent argument.
+        if output_schema is None:
+            self.unconstrained_requests.append(list(messages))
+            self.unconstrained_tools = tools
+            return ChatMessage(role=MessageRole.ASSISTANT, content="the answer is 42")
+        self.schema_carrying_requests.append(list(messages))
+        self.schema_carrying_tools = tools
+        return ChatMessage(role=MessageRole.ASSISTANT, content='{"result": 42}')
+
+
+class _PromptBoundChatModelSetup(BaseChatModelSetup):
+    """Setup binding a prompt and holding a live connection, overriding neither
+    ``chat`` nor ``chat_structured``, so both requests are built by the real methods.
+    That is what lets a test see one render the bound prompt and the other leave it
+    out.
+    """
+
+    @property
+    def model_kwargs(self) -> Dict[str, Any]:
+        return {}
+
+    def will_apply_native_structured_output(
+        self, output_schema: OutputSchema | None
+    ) -> bool:
+        return output_schema is not None
+
+
+class TestNativeFinalizationRequestShape:
+    """Tests asserting what the schema-carrying request actually carries."""
+
+    def test_finalization_request_does_not_carry_the_bound_prompt(self) -> None:
+        connection = _RecordingConnection()
+        chat_model = _PromptBoundChatModelSetup(
+            connection="c",
+            model="m",
+            prompt=Prompt.from_text(text="FRAMING-SENTINEL: answer only in haiku."),
+        )
+        chat_model._resolved_connection = connection
+        # Bound so the two requests differ in tools rather than both carrying none:
+        # against a setup that binds nothing, an empty list on the finalization proves
+        # nothing, and a finalization wrongly passing the setup's tools would still
+        # produce one.
+        tool = _StubTool()
+        chat_model.tools.append(tool)
+        ctx, sent_events, _, _ = _create_mock_runner_context(
+            chat_model, max_retries=0, retry_wait_interval_sec=0
+        )
+
+        asyncio.run(
+            chat(
+                uuid4(),
+                "test-model",
+                [ChatMessage(role=MessageRole.USER, content="what is the answer")],
+                {},
+                OutputSchema(output_schema=_StructuredResult),
+                ctx,
+            )
+        )
+
+        # The loop's own request renders the bound prompt, which is what makes the
+        # sentinel a real signal here: it is visible at this seam whenever a prompt
+        # is prepended.
+        assert len(connection.unconstrained_requests) == 1
+        assert any(
+            "FRAMING-SENTINEL" in m.content
+            for m in connection.unconstrained_requests[0]
+        )
+
+        # The schema-carrying request is the conversation, the answer the loop
+        # settled on, and the conversion instruction. Asserted on content so a change
+        # that prepends the prompt fails here instead of slipping past a length check.
+        assert len(connection.schema_carrying_requests) == 1
+        finalize_request = connection.schema_carrying_requests[0]
+        assert [m.content for m in finalize_request] == [
+            "what is the answer",
+            "the answer is 42",
+            _FINALIZE_DIRECTIVE_TEXT,
+        ]
+        assert all("FRAMING-SENTINEL" not in m.content for m in finalize_request)
+        # The loop's request advertises the bound tool, so the finalization's empty
+        # list is a real difference between the two requests.
+        assert connection.unconstrained_tools is not None
+        assert len(connection.unconstrained_tools) == 1
+        assert connection.unconstrained_tools[0] is tool
+        # A provider may drop a native schema from a request that also advertises
+        # tools, so the schema-carrying call binds none. Distinguished from an absent
+        # argument by the connection recording what it received verbatim.
+        assert connection.schema_carrying_tools == []
+        assert len(sent_events) == 1
+
+
+class TestNativeFinalizationAsyncPath:
+    """The finalization on the async durable seam, which is the production default."""
+
+    def test_finalization_runs_on_the_async_durable_seam(self) -> None:
+        chat_model = MagicMock()
+        chat_model.chat = MagicMock(
+            return_value=ChatMessage(
+                role=MessageRole.ASSISTANT, content="the answer is 42"
+            )
+        )
+        chat_model.chat_structured = MagicMock(
+            return_value=ChatMessage(
+                role=MessageRole.ASSISTANT, content='{"result": 42}'
+            )
+        )
+        ctx, sent_events, _, _ = _create_mock_runner_context(
+            chat_model, max_retries=0, retry_wait_interval_sec=0, chat_async=True
+        )
+        chat_model.will_apply_native_structured_output = MagicMock(return_value=True)
+
+        asyncio.run(
+            chat(
+                uuid4(),
+                "test-model",
+                [ChatMessage(role=MessageRole.USER, content="hi")],
+                {},
+                OutputSchema(output_schema=_StructuredResult),
+                ctx,
+            )
+        )
+
+        # AgentExecutionOptions.CHAT_ASYNC defaults to True, so this is the seam most
+        # requests actually take. Both the loop call and the finalization go through
+        # it, and neither through the synchronous one.
+        assert ctx.durable_execute_async.call_count == 2
+        ctx.durable_execute.assert_not_called()
+        assert chat_model.chat.call_count == 1
+        assert chat_model.chat_structured.call_count == 1
+        assert len(sent_events) == 1
+        assert sent_events[0].response.extra_args[STRUCTURED_OUTPUT].result == 42
+
+
+class TestNativeGateFailureStrategy:
+    """The gate is documented to raise; the configured strategy decides its fate."""
+
+    def _run(self, ctx: Any, output_schema: OutputSchema) -> None:
+        asyncio.run(
+            chat(
+                uuid4(),
+                "test-model",
+                [ChatMessage(role=MessageRole.USER, content="hi")],
+                {},
+                output_schema,
+                ctx,
+            )
+        )
+
+    def test_gate_failure_is_dropped_under_the_ignore_strategy(self) -> None:
+        chat_model = MagicMock()
+        chat_model.chat = MagicMock()
+        ctx, sent_events, _, _ = _create_mock_runner_context(
+            chat_model,
+            max_retries=0,
+            retry_wait_interval_sec=0,
+            error_handling_strategy=ErrorHandlingStrategy.IGNORE,
+        )
+        chat_model.will_apply_native_structured_output = MagicMock(
+            side_effect=ValueError("reports the output schema infeasible")
+        )
+
+        # Must not raise. A configuration error the gate reports is this request
+        # failing, and IGNORE drops a failed request instead of propagating it. The
+        # gate sitting outside the loop's try would let it escape past the strategy.
+        self._run(ctx, OutputSchema(output_schema=_StructuredResult))
+
+        assert len(sent_events) == 0
+        chat_model.chat.assert_not_called()
+
+    def test_gate_failure_propagates_under_the_fail_strategy(self) -> None:
+        chat_model = MagicMock()
+        chat_model.chat = MagicMock()
+        ctx, sent_events, _, _ = _create_mock_runner_context(
+            chat_model,
+            max_retries=0,
+            retry_wait_interval_sec=0,
+            error_handling_strategy=ErrorHandlingStrategy.FAIL,
+        )
+        chat_model.will_apply_native_structured_output = MagicMock(
+            side_effect=ValueError("reports the output schema infeasible")
+        )
+
+        with pytest.raises(ValueError, match="infeasible"):
+            self._run(ctx, OutputSchema(output_schema=_StructuredResult))
+
+        # No model call is paid for a policy no request can satisfy.
+        chat_model.chat.assert_not_called()
+        assert len(sent_events) == 0
+
+    def test_gate_is_evaluated_once_across_retries(self) -> None:
+        chat_model = MagicMock()
+        # Sized to the real call count: one failure, then the answer.
+        chat_model.chat = MagicMock(
+            side_effect=[
+                RuntimeError("transient error"),
+                ChatMessage(role=MessageRole.ASSISTANT, content='{"result": 42}'),
+            ]
+        )
+        ctx, sent_events, _, _ = _create_mock_runner_context(
+            chat_model, max_retries=1, retry_wait_interval_sec=0
+        )
+        gate = MagicMock(return_value=False)
+        chat_model.will_apply_native_structured_output = gate
+
+        self._run(ctx, OutputSchema(output_schema=_StructuredResult))
+
+        assert chat_model.chat.call_count == 2
+        # Loop-invariant: the answer cannot change between attempts, so a retry must
+        # not re-ask it. Evaluating inside the loop leaves every other test here green.
+        assert gate.call_count == 1
+        assert len(sent_events) == 1

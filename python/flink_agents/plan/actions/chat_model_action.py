@@ -52,6 +52,7 @@ from flink_agents.plan.function import PythonFunction
 
 if TYPE_CHECKING:
     from flink_agents.api.chat_models.chat_model import BaseChatModelSetup
+    from flink_agents.api.metric_group import MetricGroup
 
 _TOOL_CALL_CONTEXT = "_TOOL_CALL_CONTEXT"
 _TOOL_REQUEST_EVENT_CONTEXT = "_TOOL_REQUEST_EVENT_CONTEXT"
@@ -60,6 +61,14 @@ _PROMPT_ARGS = "prompt_args"
 _FINISH_REASON = "finish_reason"
 _TRUNCATED_FINISH_REASON = "length"
 _CONTENT_FILTERED_FINISH_REASON = "content_filter"
+
+# The instruction the schema-carrying call appends. The schema travels in the request
+# itself, so this says what to do with the text already produced rather than restating
+# the shape.
+_FINALIZE_DIRECTIVE = (
+    "Convert the previous assistant response into the required structured output"
+    " format. Preserve its meaning and do not add or infer any new information."
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -344,6 +353,94 @@ def _require_model_response(response: ChatMessage | None) -> ChatMessage:
     return response
 
 
+def _record_chat_token_metrics(
+    chat_model: "BaseChatModelSetup",
+    response: ChatMessage,
+    request_metric_group: "MetricGroup | None",
+) -> None:
+    """Record the token usage a chat response reports, when it reports all of it."""
+    if (
+        request_metric_group is not None
+        and response.extra_args.get("model_name")
+        and response.extra_args.get("promptTokens")
+        and response.extra_args.get("completionTokens")
+    ):
+        chat_model._record_token_metrics(
+            response.extra_args["model_name"],
+            response.extra_args["promptTokens"],
+            response.extra_args["completionTokens"],
+            request_metric_group,
+        )
+
+
+async def _finalize_with_native_schema(
+    chat_model: "BaseChatModelSetup",
+    model: str,
+    messages: List[ChatMessage],
+    loop_response: ChatMessage,
+    output_schema: OutputSchema,
+    llm_metadata: Dict,
+    ctx: RunnerContext,
+    request_metric_group: "MetricGroup | None",
+    *,
+    chat_async: bool,
+) -> ChatMessage:
+    """Issue the one tool-free call that carries ``output_schema`` to the provider.
+
+    Sends the conversation so far, the answer the loop settled on, and an instruction
+    to convert it. The loop's own call advertises tools, which a provider may answer by
+    dropping a native schema from the request, so the schema cannot ride along with it.
+
+    Takes a durable slot of its own beside the loop call's. Identity here is derived
+    rather than declared: ``durable_execute`` keys a call by the callable and its
+    arguments unless a caller supplies ``durable_id``, and neither call supplies
+    one, so the two separate on the callable alone, ``chat_structured`` against
+    ``chat``, and a recovered run replays the loop's answer from its own record
+    rather than paying for it a second time. An explicit id here would not make a
+    recovery that re-runs this call cheaper: it replaces only the function half of
+    the identity, while the argument half digests the pickled arguments, which is
+    not stable across processes for an output schema that is not importable by
+    reference.
+
+    Reports its own execution span, started through to succeeded or failed. A span
+    covers one chat call rather than one invocation, so this call, which reaches the
+    provider like any other, reports like one.
+    """
+    finalize_messages = [
+        *messages,
+        loop_response,
+        ChatMessage(role=MessageRole.USER, content=_FINALIZE_DIRECTIVE),
+    ]
+
+    ExecutionReporters.started(ctx, ExecutionEntityTypes.LLM, model, llm_metadata)
+    try:
+        if chat_async:
+            response = await ctx.durable_execute_async(
+                chat_model.chat_structured, finalize_messages, output_schema
+            )
+        else:
+            response = ctx.durable_execute(
+                chat_model.chat_structured, finalize_messages, output_schema
+            )
+        response = _require_model_response(response)
+    except Exception as model_error:
+        ExecutionReporters.failed(
+            ctx,
+            ExecutionEntityTypes.LLM,
+            model,
+            llm_metadata,
+            model_error,
+            ExecutionProblemCategories.MODEL_CALL_FAILED,
+        )
+        raise
+    ExecutionReporters.succeeded(ctx, ExecutionEntityTypes.LLM, model, llm_metadata)
+    _record_chat_token_metrics(chat_model, response, request_metric_group)
+    # A truncated conversion consumed its full token budget, so the token metrics
+    # above are recorded before this rejects and abandons the response.
+    _reject_incomplete_response(response)
+    return response
+
+
 async def chat(
     initial_request_id: UUID,
     model: str,
@@ -387,6 +484,30 @@ async def chat(
     total_wait_time_sec = 0
     llm_metadata = {LLMExecutionMetadataKeys.MODEL: chat_model.model}
 
+    # Loop-invariant: the answer turns only on this chat model and this schema, so a
+    # policy the connection can never satisfy is settled once instead of re-raised on
+    # every attempt, where the retry loop would spend a budget on what no retry can
+    # change. The cost is that a request ending in tool calls also asks the question,
+    # which is a local call and no round trip.
+    try:
+        apply_native_schema = (
+            output_schema is not None
+            and chat_model.will_apply_native_structured_output(output_schema)
+        )
+    except Exception as e:
+        # The gate is documented to raise when a forced native strategy meets a schema
+        # its connection cannot express. Evaluating it outside the retry loop keeps a
+        # permanent configuration error from spending a retry budget, but the error is
+        # still this request failing, so the configured strategy decides its fate the
+        # same way it decides an attempt failure's rather than it escaping raw past
+        # the strategy. No retry is offered, because no retry can change the answer.
+        if error_handling_strategy == ErrorHandlingStrategy.IGNORE:
+            _logger.warning(
+                f"Chat request {initial_request_id} failed with error: {e}, ignored."
+            )
+            return
+        raise
+
     for attempt in range(num_retries + 1):
         try:
             ExecutionReporters.started(
@@ -416,23 +537,27 @@ async def chat(
                 ctx, ExecutionEntityTypes.LLM, model, llm_metadata
             )
 
-            if (
-                request_metric_group is not None
-                and response.extra_args.get("model_name")
-                and response.extra_args.get("promptTokens")
-                and response.extra_args.get("completionTokens")
-            ):
-                chat_model._record_token_metrics(
-                    response.extra_args["model_name"],
-                    response.extra_args["promptTokens"],
-                    response.extra_args["completionTokens"],
-                    request_metric_group,
-                )
+            _record_chat_token_metrics(chat_model, response, request_metric_group)
             # A truncated response consumed its full token budget, so the token
             # metrics above are recorded before this rejects and abandons the
             # response.
             _reject_incomplete_response(response)
             if output_schema is not None and len(response.tool_calls) == 0:
+                if apply_native_schema:
+                    # One more tool-free call carries the schema, and its answer is
+                    # what gets parsed; the loop's answer reaches the model only as
+                    # the text to convert.
+                    response = await _finalize_with_native_schema(
+                        chat_model,
+                        model,
+                        messages,
+                        response,
+                        output_schema,
+                        llm_metadata,
+                        ctx,
+                        request_metric_group,
+                        chat_async=chat_async,
+                    )
                 response = _generate_structured_output_with_report(
                     ctx, response, output_schema
                 )
