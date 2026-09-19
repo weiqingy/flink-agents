@@ -20,6 +20,7 @@ package org.apache.flink.agents.plan.actions;
 import org.apache.flink.agents.api.agents.Agent;
 import org.apache.flink.agents.api.agents.AgentExecutionOptions;
 import org.apache.flink.agents.api.chat.messages.ChatMessage;
+import org.apache.flink.agents.api.chat.messages.MessageRole;
 import org.apache.flink.agents.api.chat.model.BaseChatModelSetup;
 import org.apache.flink.agents.api.chat.model.python.PythonChatModelSetup;
 import org.apache.flink.agents.api.context.DurableCallable;
@@ -34,6 +35,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -50,6 +52,14 @@ import static org.apache.flink.agents.plan.actions.Utils.supportAsync;
 public final class ChatModelInvoker {
 
     private static final Logger LOG = LoggerFactory.getLogger(ChatModelInvoker.class);
+
+    /**
+     * The instruction the schema-carrying call appends. The schema travels in the request itself,
+     * so this says what to do with the text already produced rather than restating the shape.
+     */
+    private static final String FINALIZE_DIRECTIVE =
+            "Convert the previous assistant response into the required structured output format."
+                    + " Preserve its meaning and do not add or infer any new information.";
 
     private ChatModelInvoker() {}
 
@@ -169,6 +179,21 @@ public final class ChatModelInvoker {
                         ? Map.of()
                         : Map.of(LLMExecutionMetadataKeys.MODEL, chatModel.getModel());
 
+        // Loop-invariant: the answer turns only on this chat model and this schema, so a policy
+        // the connection can never satisfy is settled once instead of re-raised on every attempt.
+        // The cost is that a request ending in tool calls also asks the question, which is a local
+        // call and no round trip.
+        boolean applyNativeSchema;
+        try {
+            applyNativeSchema =
+                    outputSchema != null && chatModel.willApplyNativeStructuredOutput(outputSchema);
+        } catch (Exception e) {
+            // A schema this connection can never carry is this candidate failing, so the fallback
+            // loop and the error-handling strategy see it like any other attempt failure rather
+            // than it escaping raw.
+            throw new ChatAttemptFailed(model, chatModel, e, 0, 0);
+        }
+
         for (int attempt = 0; attempt < numRetries + 1; attempt++) {
             try {
                 ExecutionReporters.started(
@@ -196,6 +221,25 @@ public final class ChatModelInvoker {
                 ChatModelAction.rejectIncompleteResponse(response);
                 // only generate structured output for final response.
                 if (outputSchema != null && response.getToolCalls().isEmpty()) {
+                    if (applyNativeSchema) {
+                        // The loop's own call advertises tools, which a provider may answer by
+                        // dropping a native schema from the request, so the schema cannot ride
+                        // along with it. One more tool-free call carries the schema, and its
+                        // answer is what gets parsed; the loop's answer reaches the model only
+                        // as the text to convert.
+                        response =
+                                finalizeWithNativeSchema(
+                                        chatModel,
+                                        model,
+                                        durableCallId,
+                                        messages,
+                                        response,
+                                        outputSchema,
+                                        llmMetadata,
+                                        ctx,
+                                        chatAsync,
+                                        requestMetricGroup);
+                    }
                     response =
                             ChatModelAction.generateStructuredOutputWithReport(
                                     ctx, response, outputSchema);
@@ -235,5 +279,75 @@ public final class ChatModelInvoker {
             }
         }
         throw new IllegalStateException("Unreachable chat retry state.");
+    }
+
+    /**
+     * Issues the one tool-free call that carries {@code outputSchema} to the provider, sending the
+     * conversation so far, the answer the loop settled on, and an instruction to convert it.
+     *
+     * <p>Takes a durable slot of its own alongside the loop call's, so a recovered run replays the
+     * loop's answer from its own record instead of paying for it a second time.
+     *
+     * <p>Reports its own execution span, started through to succeeded or failed. A span covers one
+     * chat call rather than one invocation — each retry attempt and each tool round already emits
+     * its own pair — so this call, which reaches the provider like any other, reports like one.
+     */
+    private static ChatMessage finalizeWithNativeSchema(
+            BaseChatModelSetup chatModel,
+            String model,
+            String durableCallId,
+            List<ChatMessage> messages,
+            ChatMessage loopResponse,
+            Object outputSchema,
+            Map<String, Object> llmMetadata,
+            RunnerContext ctx,
+            boolean chatAsync,
+            @Nullable FlinkAgentsMetricGroup requestMetricGroup)
+            throws Exception {
+        List<ChatMessage> finalizeMessages = new ArrayList<>(messages);
+        finalizeMessages.add(loopResponse);
+        finalizeMessages.add(new ChatMessage(MessageRole.USER, FINALIZE_DIRECTIVE));
+
+        DurableCallable<ChatMessage> finalizeCallable =
+                new DurableCallable<>() {
+                    @Override
+                    public String getId() {
+                        return durableCallId + ":final";
+                    }
+
+                    @Override
+                    public Class<ChatMessage> getResultClass() {
+                        return ChatMessage.class;
+                    }
+
+                    @Override
+                    public ChatMessage call() throws Exception {
+                        return chatModel.chatStructured(finalizeMessages, Map.of(), outputSchema);
+                    }
+                };
+
+        ChatMessage finalizeResponse;
+        ExecutionReporters.started(ctx, ExecutionReporter.EntityTypes.LLM, model, llmMetadata);
+        try {
+            finalizeResponse =
+                    chatAsync
+                            ? ctx.durableExecuteAsync(finalizeCallable)
+                            : ctx.durableExecute(finalizeCallable);
+            Objects.requireNonNull(finalizeResponse, "ChatModel returned a null response.");
+        } catch (Throwable modelError) {
+            throw ChatModelAction.reportFailedAndPropagate(
+                    ctx,
+                    ExecutionReporter.EntityTypes.LLM,
+                    model,
+                    llmMetadata,
+                    modelError,
+                    ExecutionReporter.ProblemCategories.MODEL_CALL_FAILED);
+        }
+        ExecutionReporters.succeeded(ctx, ExecutionReporter.EntityTypes.LLM, model, llmMetadata);
+        ChatModelAction.recordChatTokenMetrics(chatModel, finalizeResponse, requestMetricGroup);
+        // A truncated conversion consumed its full token budget, so the token metrics above are
+        // recorded before this rejects and abandons the response.
+        ChatModelAction.rejectIncompleteResponse(finalizeResponse);
+        return finalizeResponse;
     }
 }

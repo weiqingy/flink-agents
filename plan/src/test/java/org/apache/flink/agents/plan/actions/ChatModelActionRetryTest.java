@@ -20,19 +20,27 @@ package org.apache.flink.agents.plan.actions;
 import org.apache.flink.agents.api.Event;
 import org.apache.flink.agents.api.agents.Agent;
 import org.apache.flink.agents.api.agents.AgentExecutionOptions;
+import org.apache.flink.agents.api.agents.OutputSchema;
 import org.apache.flink.agents.api.chat.messages.ChatMessage;
 import org.apache.flink.agents.api.chat.messages.MessageRole;
+import org.apache.flink.agents.api.chat.model.BaseChatModelConnection;
 import org.apache.flink.agents.api.chat.model.BaseChatModelSetup;
 import org.apache.flink.agents.api.context.DurableCallable;
 import org.apache.flink.agents.api.context.MemoryObject;
 import org.apache.flink.agents.api.context.RunnerContext;
 import org.apache.flink.agents.api.event.ChatResponseEvent;
+import org.apache.flink.agents.api.event.ToolRequestEvent;
 import org.apache.flink.agents.api.event.ToolResponseEvent;
 import org.apache.flink.agents.api.metrics.FlinkAgentsMetricGroup;
+import org.apache.flink.agents.api.resource.ResourceDescriptor;
 import org.apache.flink.agents.api.resource.ResourceType;
+import org.apache.flink.agents.api.tools.Tool;
 import org.apache.flink.agents.api.tools.ToolResponse;
 import org.apache.flink.agents.api.trace.ExecutionReporter;
 import org.apache.flink.agents.api.trace.LLMExecutionMetadataKeys;
+import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.metrics.Counter;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -631,7 +639,347 @@ class ChatModelActionRetryTest {
                 .isEqualTo("hello");
     }
 
+    /**
+     * The conversion instruction the schema-carrying call appends. Spelled out here rather than
+     * read from the invoker so the assertion pins the exact words a provider receives: a test that
+     * imported the constant would agree with any edit to it, including one that emptied it.
+     */
+    private static final String FINALIZE_DIRECTIVE =
+            "Convert the previous assistant response into the required structured"
+                    + " output format. Preserve its meaning and do not add or infer"
+                    + " any new information.";
+
+    private static OutputSchema rowTypeSchema() {
+        return new OutputSchema(
+                new RowTypeInfo(
+                        new TypeInformation[] {BasicTypeInfo.STRING_TYPE_INFO},
+                        new String[] {"answer"}));
+    }
+
+    @Test
+    void nativeSchemaParsesTheFinalizationResponseNotTheLoopResponse() throws Exception {
+        RunnerContext reportingCtx = reportingRunnerContext();
+        BaseChatModelSetup chatModel = configureReportingChatContext(reportingCtx);
+        // Prose the parser could never read: only the finalization response can satisfy it.
+        when(chatModel.chat(any(), any(), any()))
+                .thenReturn(new ChatMessage(MessageRole.ASSISTANT, "the answer is 42"));
+        when(chatModel.willApplyNativeStructuredOutput(any())).thenReturn(true);
+        when(chatModel.chatStructured(any(), any(), any()))
+                .thenReturn(new ChatMessage(MessageRole.ASSISTANT, "{\"answer\":\"42\"}"));
+
+        ChatModelAction.chat(
+                UUID.randomUUID(),
+                "test-model",
+                List.of(new ChatMessage(MessageRole.USER, "hi")),
+                Map.of(),
+                Map.class,
+                reportingCtx);
+
+        verify(chatModel).chatStructured(any(), any(), any());
+        assertThat(sentEvents).hasSize(1);
+        assertThat(ChatResponseEvent.fromEvent(sentEvents.get(0)).getResponse().getContent())
+                .isEqualTo("{\"answer\":\"42\"}");
+    }
+
+    @Test
+    void schemaTheStrategyKeepsInThePromptIssuesNoFinalizationCall() throws Exception {
+        RunnerContext reportingCtx = reportingRunnerContext();
+        BaseChatModelSetup chatModel = configureReportingChatContext(reportingCtx);
+        when(chatModel.chat(any(), any(), any()))
+                .thenReturn(new ChatMessage(MessageRole.ASSISTANT, "{\"answer\":\"42\"}"));
+        // Stated rather than left to the mock default: a schema that will not travel natively
+        // is the case that must cost exactly what it always has.
+        when(chatModel.willApplyNativeStructuredOutput(any())).thenReturn(false);
+
+        ChatModelAction.chat(
+                UUID.randomUUID(),
+                "test-model",
+                List.of(new ChatMessage(MessageRole.USER, "hi")),
+                Map.of(),
+                rowTypeSchema(),
+                reportingCtx);
+
+        // The gate was consulted and answered no. Without this the test cannot tell a suppressed
+        // finalization from an invoker that never asks the question at all.
+        verify(chatModel).willApplyNativeStructuredOutput(any());
+        verify(chatModel, never()).chatStructured(any(), any(), any());
+        verify(chatModel, times(1)).chat(any(), any(), any());
+        assertThat(sentEvents).hasSize(1);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void finalizationCallAppendsTheFinalAnswerAndTheConversionDirective() throws Exception {
+        RunnerContext reportingCtx = reportingRunnerContext();
+        BaseChatModelSetup chatModel = configureReportingChatContext(reportingCtx);
+        ChatMessage loopAnswer = new ChatMessage(MessageRole.ASSISTANT, "the answer is 42");
+        when(chatModel.chat(any(), any(), any())).thenReturn(loopAnswer);
+        when(chatModel.willApplyNativeStructuredOutput(any())).thenReturn(true);
+        when(chatModel.chatStructured(any(), any(), any()))
+                .thenReturn(new ChatMessage(MessageRole.ASSISTANT, "{\"answer\":\"42\"}"));
+
+        ChatModelAction.chat(
+                UUID.randomUUID(),
+                "test-model",
+                List.of(new ChatMessage(MessageRole.USER, "hi")),
+                Map.of(),
+                Map.class,
+                reportingCtx);
+
+        ArgumentCaptor<List<ChatMessage>> messagesCaptor = ArgumentCaptor.forClass(List.class);
+        verify(chatModel).chatStructured(messagesCaptor.capture(), any(), any());
+        List<ChatMessage> sent = messagesCaptor.getValue();
+        assertThat(sent).hasSize(3);
+        assertThat(sent.get(0).getContent()).isEqualTo("hi");
+        assertThat(sent.get(1)).isSameAs(loopAnswer);
+        assertThat(sent.get(2).getRole()).isEqualTo(MessageRole.USER);
+        assertThat(sent.get(2).getContent()).isEqualTo(FINALIZE_DIRECTIVE);
+        // The schema travels through the tool-free channel, so the tool-binding chat() path
+        // runs once for the loop and never for the conversion.
+        verify(chatModel, times(1)).chat(any(), any(), any());
+    }
+
+    @Test
+    void rejectedFinishReasonIssuesNoFinalizationCall() throws Exception {
+        RunnerContext reportingCtx = reportingRunnerContext();
+        BaseChatModelSetup chatModel = configureReportingChatContext(reportingCtx);
+        when(chatModel.chat(any(), any(), any()))
+                .thenReturn(
+                        new ChatMessage(
+                                MessageRole.ASSISTANT,
+                                "partial answ",
+                                Map.of("finish_reason", "length")));
+        when(chatModel.willApplyNativeStructuredOutput(any())).thenReturn(true);
+
+        assertThatThrownBy(
+                        () ->
+                                ChatModelAction.chat(
+                                        UUID.randomUUID(),
+                                        "test-model",
+                                        List.of(new ChatMessage(MessageRole.USER, "hi")),
+                                        Map.of(),
+                                        Map.class,
+                                        reportingCtx))
+                .isInstanceOf(IllegalStateException.class);
+
+        // An answer the model never finished is abandoned before anything is paid to convert it:
+        // the gate is asked, and the rejection still stops the conversion from being issued.
+        verify(chatModel).willApplyNativeStructuredOutput(any());
+        verify(chatModel, never()).chatStructured(any(), any(), eq(Map.class));
+    }
+
+    @Test
+    void toolCallResponseIssuesNoFinalizationCall() throws Exception {
+        RunnerContext reportingCtx = reportingRunnerContext();
+        BaseChatModelSetup chatModel = configureReportingChatContext(reportingCtx);
+        when(chatModel.chat(any(), any(), any()))
+                .thenReturn(
+                        new ChatMessage(
+                                MessageRole.ASSISTANT,
+                                "",
+                                List.of(
+                                        Map.of(
+                                                "id",
+                                                "call-1",
+                                                "type",
+                                                "function",
+                                                "function",
+                                                Map.of("name", "lookup", "arguments", Map.of())))));
+        when(chatModel.willApplyNativeStructuredOutput(any())).thenReturn(true);
+
+        ChatModelAction.chat(
+                UUID.randomUUID(),
+                "test-model",
+                List.of(new ChatMessage(MessageRole.USER, "hi")),
+                Map.of(),
+                Map.class,
+                reportingCtx);
+
+        // The loop is still asking for tools, so the answer to convert does not exist yet: the
+        // gate is asked, and the outstanding tool calls still stop the conversion.
+        verify(chatModel).willApplyNativeStructuredOutput(any());
+        verify(chatModel, never()).chatStructured(any(), any(), eq(Map.class));
+        assertThat(sentEvents).hasSize(1);
+        assertThat(sentEvents.get(0).getType()).isEqualTo(ToolRequestEvent.EVENT_TYPE);
+    }
+
+    @Test
+    void finalizationCallEmitsItsOwnLlmSpan() throws Exception {
+        RunnerContext reportingCtx = reportingRunnerContext();
+        BaseChatModelSetup chatModel = configureReportingChatContext(reportingCtx);
+        when(chatModel.chat(any(), any(), any()))
+                .thenReturn(new ChatMessage(MessageRole.ASSISTANT, "the answer is 42"));
+        when(chatModel.willApplyNativeStructuredOutput(any())).thenReturn(true);
+        when(chatModel.chatStructured(any(), any(), any()))
+                .thenReturn(new ChatMessage(MessageRole.ASSISTANT, "{\"answer\":\"42\"}"));
+
+        ChatModelAction.chat(
+                UUID.randomUUID(),
+                "test-model",
+                List.of(new ChatMessage(MessageRole.USER, "hi")),
+                Map.of(),
+                Map.class,
+                reportingCtx);
+
+        // A span covers one chat call, not one invocation: two calls reached the provider, so
+        // two pairs are reported.
+        ExecutionReporter reporter = (ExecutionReporter) reportingCtx;
+        verify(reporter, times(2))
+                .reportExecutionStarted(
+                        ExecutionReporter.EntityTypes.LLM, "test-model", LLM_METADATA);
+        verify(reporter, times(2))
+                .reportExecutionSucceeded(
+                        ExecutionReporter.EntityTypes.LLM, "test-model", LLM_METADATA);
+    }
+
+    @Test
+    void finalizationCallFailureIsReportedAsAModelCallFailure() throws Exception {
+        RunnerContext reportingCtx = reportingRunnerContext();
+        BaseChatModelSetup chatModel = configureReportingChatContext(reportingCtx);
+        when(chatModel.chat(any(), any(), any()))
+                .thenReturn(new ChatMessage(MessageRole.ASSISTANT, "the answer is 42"));
+        when(chatModel.willApplyNativeStructuredOutput(any())).thenReturn(true);
+        when(chatModel.chatStructured(any(), any(), any()))
+                .thenThrow(new RuntimeException("conversion call exploded"));
+
+        assertThatThrownBy(
+                        () ->
+                                ChatModelAction.chat(
+                                        UUID.randomUUID(),
+                                        "test-model",
+                                        List.of(new ChatMessage(MessageRole.USER, "hi")),
+                                        Map.of(),
+                                        Map.class,
+                                        reportingCtx))
+                .hasMessageContaining("conversion call exploded");
+
+        ExecutionReporter reporter = (ExecutionReporter) reportingCtx;
+        // Without a span of its own the failure would land nowhere: the loop call's success
+        // would be the last word and the error would be attributed to nothing.
+        verify(reporter)
+                .reportExecutionFailed(
+                        eq(ExecutionReporter.EntityTypes.LLM),
+                        eq("test-model"),
+                        eq(LLM_METADATA),
+                        any(Throwable.class),
+                        eq(ExecutionReporter.ProblemCategories.MODEL_CALL_FAILED));
+        // Both calls started; only the loop's succeeded.
+        verify(reporter, times(2))
+                .reportExecutionStarted(
+                        ExecutionReporter.EntityTypes.LLM, "test-model", LLM_METADATA);
+        verify(reporter, times(1))
+                .reportExecutionSucceeded(
+                        ExecutionReporter.EntityTypes.LLM, "test-model", LLM_METADATA);
+    }
+
+    @Test
+    void finalizationRequestDoesNotCarryTheBoundPrompt() throws Exception {
+        RecordingConnection connection = new RecordingConnection();
+        PromptBoundChatModel chatModel =
+                new PromptBoundChatModel("FRAMING-SENTINEL: answer only in haiku.", connection);
+        RunnerContext ctx = reportingContextFor(chatModel);
+
+        ChatModelAction.chat(
+                UUID.randomUUID(),
+                "test-model",
+                List.of(new ChatMessage(MessageRole.USER, "what is the answer")),
+                Map.of(),
+                Map.class,
+                ctx);
+
+        // The loop's own request renders the bound prompt, which is what makes the sentinel a
+        // real signal here: it is visible at this seam whenever a prompt is prepended.
+        assertThat(connection.unconstrainedRequests).hasSize(1);
+        assertThat(connection.unconstrainedRequests.get(0))
+                .anySatisfy(m -> assertThat(m.getContent()).contains("FRAMING-SENTINEL"));
+
+        // The schema-carrying request is the conversation, the answer the loop settled on, and
+        // the conversion instruction. Asserted on content so a change that prepends the prompt
+        // fails here instead of slipping past a length check.
+        assertThat(connection.schemaCarryingRequests).hasSize(1);
+        List<ChatMessage> finalizeRequest = connection.schemaCarryingRequests.get(0);
+        assertThat(finalizeRequest)
+                .extracting(ChatMessage::getContent)
+                .containsExactly("what is the answer", "the answer is 42", FINALIZE_DIRECTIVE);
+        assertThat(finalizeRequest)
+                .noneSatisfy(m -> assertThat(m.getContent()).contains("FRAMING-SENTINEL"));
+    }
+
     // --- Helper methods ---
+
+    /**
+     * A connection recording the messages of every request it receives, so a test can assert on
+     * what a call actually carries. Overrides the schema-carrying overload because the base rejects
+     * a non-null schema, which is what a connection without a native translation does.
+     */
+    private static class RecordingConnection extends BaseChatModelConnection {
+        final List<List<ChatMessage>> unconstrainedRequests = new ArrayList<>();
+        final List<List<ChatMessage>> schemaCarryingRequests = new ArrayList<>();
+
+        RecordingConnection() {
+            super(new ResourceDescriptor("recording-connection", Map.of()), null);
+        }
+
+        @Override
+        public ResourceType getResourceType() {
+            return ResourceType.CHAT_MODEL_CONNECTION;
+        }
+
+        @Override
+        public ChatMessage chat(
+                List<ChatMessage> messages, List<Tool> tools, Map<String, Object> modelParams) {
+            unconstrainedRequests.add(List.copyOf(messages));
+            return new ChatMessage(MessageRole.ASSISTANT, "the answer is 42");
+        }
+
+        @Override
+        public ChatMessage chat(
+                List<ChatMessage> messages,
+                List<Tool> tools,
+                Map<String, Object> modelParams,
+                Object outputSchema) {
+            schemaCarryingRequests.add(List.copyOf(messages));
+            return new ChatMessage(MessageRole.ASSISTANT, "{\"answer\":\"42\"}");
+        }
+    }
+
+    /**
+     * A setup binding a prompt and holding a live connection, overriding neither {@code chat} nor
+     * {@code chatStructured}. Both requests are therefore built by the real methods, which is what
+     * lets a test see that one renders the bound prompt and the other leaves it out.
+     */
+    private static class PromptBoundChatModel extends BaseChatModelSetup {
+        PromptBoundChatModel(String template, BaseChatModelConnection connection) {
+            super(new ResourceDescriptor("prompt-bound", Map.of()), null);
+            this.prompt = new org.apache.flink.agents.api.prompt.Prompt.LocalPrompt(template);
+            this.connection = connection;
+        }
+
+        @Override
+        public boolean willApplyNativeStructuredOutput(Object outputSchema) {
+            return outputSchema != null;
+        }
+
+        @Override
+        public Map<String, Object> getParameters() {
+            // Mutable: both chat() and chatStructured() merge per-call parameters into whatever
+            // this returns, so an immutable map would fail before either request is built.
+            return new HashMap<>();
+        }
+    }
+
+    private RunnerContext reportingContextFor(BaseChatModelSetup chatModel) throws Exception {
+        RunnerContext ctx = reportingRunnerContext();
+        when(ctx.getResource(anyString(), eq(ResourceType.CHAT_MODEL))).thenReturn(chatModel);
+        MemoryObject memory = createStatefulMemoryObject();
+        when(ctx.getSensoryMemory()).thenReturn(memory);
+        when(ctx.getActionMetricGroup()).thenReturn(mockActionMetricGroup);
+        when(ctx.<ChatMessage>durableExecute(any()))
+                .thenAnswer(inv -> inv.<DurableCallable<ChatMessage>>getArgument(0).call());
+        doAnswer(inv -> sentEvents.add(inv.getArgument(0))).when(ctx).sendEvent(any());
+        when(ctx.getConfig()).thenReturn(readableConfig(Agent.ErrorHandlingStrategy.FAIL));
+        return ctx;
+    }
 
     private void configureRetryStrategy(int maxRetries, int waitIntervalSec) {
         when(mockCtx.getConfig())

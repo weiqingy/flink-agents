@@ -82,10 +82,32 @@ public class ChatModelActionRoutingTest {
      */
     static class FakeChatModel extends BaseChatModelSetup {
         private final Deque<Object> outcomes = new ArrayDeque<>();
+        private boolean nativeStructuredOutput;
 
         FakeChatModel(Object... outcomes) {
             super(new ResourceDescriptor("fake", Map.of()), null);
             Collections.addAll(this.outcomes, outcomes);
+        }
+
+        /**
+         * Makes a schema-carrying request resolve to the native channel. Declared on the base so
+         * every variant below answers both structured-output members without an open connection —
+         * the real ones consult one and would fail here.
+         */
+        FakeChatModel withNativeStructuredOutput() {
+            this.nativeStructuredOutput = true;
+            return this;
+        }
+
+        @Override
+        public boolean willApplyNativeStructuredOutput(Object outputSchema) {
+            return nativeStructuredOutput && outputSchema != null;
+        }
+
+        @Override
+        public ChatMessage chatStructured(
+                List<ChatMessage> messages, Map<String, Object> modelParams, Object outputSchema) {
+            return ChatMessage.assistant("{\"answer\":\"42\"}");
         }
 
         @Override
@@ -627,6 +649,41 @@ public class ChatModelActionRoutingTest {
                 new ChatRequestEvent("router", List.of(ChatMessage.user("write sql"))), ctx);
         // the decision and the chat attempt are distinct durable calls with routed ids
         assertThat(ctx.durableCallIds).containsExactly("route:router", "chat:router:big");
+    }
+
+    @Test
+    void directSchemaRequestUsesDistinctFinalizationDurableCallId() throws Exception {
+        FakeRunnerContext ctx =
+                new FakeRunnerContext(null)
+                        .register("plain", new FakeChatModel().withNativeStructuredOutput());
+        ChatModelAction.processChatRequestOrToolResponse(
+                new ChatRequestEvent("plain", List.of(ChatMessage.user("hi")), Map.of(), Map.class),
+                ctx);
+        // the schema-carrying call takes a durable slot of its own beside the loop call's, so
+        // recovery replays the loop answer instead of buying it again
+        assertThat(ctx.durableCallIds).containsExactly("chat", "chat:final");
+    }
+
+    @Test
+    void routedSchemaRequestUsesRoutedFinalizationDurableCallId() throws Exception {
+        ModelRouter router =
+                new ModelRouter(
+                        ModelRouter.of("small", "big")
+                                .strategy(Strategies.rules(Map.of("big", "\\bsql\\b")))
+                                .defaultModel("small")
+                                .build(),
+                        null);
+        FakeRunnerContext ctx =
+                new FakeRunnerContext(router)
+                        .register("big", new FakeChatModel().withNativeStructuredOutput());
+        ChatModelAction.processChatRequestOrToolResponse(
+                new ChatRequestEvent(
+                        "router", List.of(ChatMessage.user("write sql")), Map.of(), Map.class),
+                ctx);
+        // the finalization slot is per candidate: it extends the candidate's own id, so a
+        // fallback to another model cannot collide with it
+        assertThat(ctx.durableCallIds)
+                .containsExactly("route:router", "chat:router:big", "chat:router:big:final");
     }
 
     @Test
